@@ -1,0 +1,1492 @@
+diff --git a/mcp.json b/mcp.json
+index 01368ab..8b84a53 100644
+--- a/mcp.json
++++ b/mcp.json
+@@ -5,7 +5,7 @@
+       "args": [
+         "-y",
+         "mcp-remote",
+-        "https://mcp.tavily.com/mcp/?tavilyApiKey=你的key"
++        "https://mcp.tavily.com/mcp/?tavilyApiKey=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"
+       ]
+     }
+   }
+diff --git a/miniagent/agent.py b/miniagent/agent.py
+index 047b220..47e83a7 100644
+--- a/miniagent/agent.py
++++ b/miniagent/agent.py
+@@ -57,11 +57,6 @@ You are a helpful, empathetic assistant with access to tools. Follow these rules
+ 
+ Available tools: {tools_prompt}
+ 
+-0.**Skill Selection** (On-Demand):
+-   - Check if the user's request matches any registered skill (e.g., literature review -> `literature_reviewer`, coding -> `coder`).
+-   - If matched: Call `use_skill` FIRST, then follow its instructions.
+-   - If unmatched: Skip. Answer directly or use general tools (search, read/write).
+-
+ 1. **Tool format** (required):
+    TOOL: <tool_name>
+    ARGS: {{"parameter_name": "parameter_value"}}
+@@ -88,14 +83,52 @@ Available tools: {tools_prompt}
+ 5. **Final Output Format**:
+    - Use Simplified Chinese as the primary language. Proper nouns, technical terms, acronyms, and file/API names may remain in English.
+    - Use markdown for readability when helpful.
++   - **Length discipline**: If the user specifies a length (e.g. "800字", "2000 words"), your final answer MUST stay close to it (allow ±15%). Never write a much longer essay than requested. When in doubt, be concise rather than verbose.
++
++6. **File writing safety**:
++   - Before using `write` or `edit` tools to create or modify files, ALWAYS ask the user for confirmation first (e.g., "I'll write this to {{path}}, ok?").
++   - Only proceed if the user agrees. If the user didn't explicitly request a file, output the content directly in your response instead.
++   - This rule does NOT apply to reading files, searching, or running non-destructive commands.
+ 
+-6. **Interpersonal skills**:
++7. **Interpersonal skills**:
+    - Greet briefly when appropriate.
+    - If request is vague, ask clarifying questions BEFORE using tools.
+    - Acknowledge user's emotions (e.g., "I understand you're looking for...").
+    - Respond naturally, politely, and helpfully.
+ 
+ 
++Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess."""
++
++    # Native FC 模式专用模板：不需要文本 TOOL: 格式，改用 tool_schemas 调用
++    _NATIVE_MODE_PROMPT = """\
++{base_prompt}
++
++You are a helpful, empathetic assistant with access to tools. Follow these rules:
++
++You have the following tools available (use them via the tool-calling interface, never print TOOL:/ARGS: text): {tools_prompt}
++
++1. **Tool usage**:
++   - When you need information or need to perform an action, call the appropriate tool with correct arguments.
++   - Wait for the tool result, then continue.
++
++2. **When to search**:
++   - For factual, recent, or verifiable info (news, data, citations), ALWAYS use tavily_search or web_search first.
++   - Use internal knowledge only for common sense, or if search returns nothing.
++
++3. **Response & Termination**:
++   - After executing a tool, explain the result clearly.
++   - **When you believe you have fully answered the user's question (whether or not you used a tool), you MUST start your final response with `FINAL_ANSWER:`**.
++   - After using `FINAL_ANSWER:`, do NOT call any more tools. This is the only way to end the task.
++
++4. **Final Output Format**:
++   - Use Simplified Chinese as the primary language. Proper nouns, technical terms, acronyms, and file/API names may remain in English.
++   - Use markdown for readability when helpful.
++   - **Length discipline**: If the user specifies a length (e.g. "800字", "2000 words"), your final answer MUST stay close to it (allow ±15%). Never write a much longer essay than requested. When in doubt, be concise rather than verbose.
++
++5. **File writing safety**:
++   - Before using `write` or `edit` tools to create or modify files, ALWAYS ask the user for confirmation first.
++   - Only proceed if the user agrees. If the user didn't explicitly request a file, output the content directly in your response instead.
++
+ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess."""
+ 
+ 
+@@ -111,6 +144,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         use_reflector: bool = False,
+         confirm_dangerous: bool = False,
+         confirm_callback: Optional[Callable[[str], bool]] = None,
++        confirm_file_writes: Optional[bool] = None,
++        auto_route_skills: bool = True,
++        llm_route_skills: Optional[bool] = None,
+         **kwargs
+     ):
+         """
+@@ -125,6 +161,15 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             use_reflector: Whether to use the Reflector to improve reasoning
+             confirm_dangerous: If True, dangerous bash commands require confirmation
+             confirm_callback: Function(cmd) -> bool for confirmation. Defaults to stdin prompt.
++            confirm_file_writes: If True, write/edit tool calls require user confirmation
++                before touching the filesystem (default: env CONFIRM_FILE_WRITES, or True).
++            auto_route_skills: If True, automatically load a matching skill from the user's
++                query before the agent loop starts (no longer relies on the LLM deciding
++                on its own to call use_skill).
++            llm_route_skills: If True, skill routing is decided by the LLM (send the skill
++                list + user query to the model, it picks one skill or "none"), with the
++                keyword scoring system only as a fallback when the LLM call fails or its
++                answer is unparseable. Defaults to env LLM_ROUTE_SKILLS (enabled unless "0").
+             **kwargs: Additional parameters for the OpenAI client
+         """
+         self.model = model
+@@ -133,6 +178,12 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         self.temperature = temperature
+         self._base_temperature = temperature  # 保存初始基准温度，用于重置
+         self.system_prompt = system_prompt
++        self.auto_route_skills = auto_route_skills
++        # LLM 路由：默认开启（把 skill 列表 + 用户问题交给模型决策，评分系统仅兜底）。
++        # 可用 LLM_ROUTE_SKILLS=0 关闭，退回纯评分路由。
++        if llm_route_skills is None:
++            llm_route_skills = os.environ.get("LLM_ROUTE_SKILLS", "1").lower() not in ("0", "false", "no")
++        self.llm_route_skills = llm_route_skills
+ 
+         
+ 
+@@ -154,8 +205,17 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         self.use_reflector = use_reflector
+         self.confirm_dangerous = confirm_dangerous
+         self.confirm_callback = confirm_callback
++        # 文件写入确认：默认开启（用户明确要求 write/edit 前必须先征求同意），
++        # 可用 CONFIRM_FILE_WRITES=0 关闭（如无人值守/自动化场景）
++        if confirm_file_writes is None:
++            confirm_file_writes = os.environ.get("CONFIRM_FILE_WRITES", "1").lower() not in ("0", "false", "no")
++        self.confirm_file_writes = confirm_file_writes
+         self._skill_tool_whitelist = None   # 存储技能允许的工具名称列表，None表示不过滤
+         
++        # 工具描述 prompt 缓存（_build_tools_prompt 的结果，按工具集变化失效）
++        self._tools_prompt_cache: Optional[str] = None
++        self._tools_prompt_cache_key: Optional[tuple] = None
++        
+         # Cache config limits (read env vars once, not per-request)
+         self._max_context_messages = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
+         self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "800000"))     #16000改到800000，同步改.env文件
+@@ -226,6 +286,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+                 raise ValueError(f"Tool is missing a required field: {key}")
+                 
+         self.tools.append(tool)
++        # 工具集变化，使工具描述缓存失效
++        self._tools_prompt_cache = None
++        self._tools_prompt_cache_key = None
+         logger.debug(f"Added tool: {tool['name']}")
+     
+     def load_builtin_tool(self, tool_name: str) -> bool:
+@@ -283,6 +346,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         self._skill_tool_whitelist = None
+         # 恢复用户最初设定的温度，避免被上次技能修改
+         self.temperature = self._base_temperature
++        # 技能变化，工具描述缓存失效
++        self._tools_prompt_cache = None
++        self._tools_prompt_cache_key = None
+         logger.debug("Skill state has been reset.")
+ 
+     
+@@ -302,7 +368,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+         skill = get_skill(skill_name)
+         if not skill:
+-            self._reset_skill_state()
++            # 修复：加载失败不应清空已加载的 skill 状态（原代码调用 _reset_skill_state 会误清）
+             console.print(f"[dim]❌ Skill load FAILED: '{skill_name}' (not found)[/dim]")
+             return f"错误：未找到技能 '{skill_name}'。可用技能：{list(_SKILLS.keys())}"
+     
+@@ -332,13 +398,21 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         """
+         构建工具描述字符串，供 system prompt 使用。
+         如果当前加载了技能且技能指定了工具白名单，则只显示白名单中的工具。
++
++        使用缓存：同一技能/同一工具集下只构建一次，避免每轮迭代重复拼接。
+         """
+         # 获取当前应该展示的工具列表（根据技能白名单过滤）
+         tools_to_show = self._get_filtered_tools()
+ 
++        # 缓存键：白名单工具名序列（同一技能下工具不变，无需重复构建）
++        cache_key = tuple(t["name"] for t in tools_to_show)
++        if self._tools_prompt_cache_key == cache_key and self._tools_prompt_cache is not None:
++            return self._tools_prompt_cache
++
+         # 如果最终列表为空，直接返回提示信息（避免空描述）
+         if not tools_to_show:
+-            return "(没有可用工具)"
++            self._tools_prompt_cache, self._tools_prompt_cache_key = "(没有可用工具)", cache_key
++            return self._tools_prompt_cache
+ 
+         tools_desc = []
+         for tool in tools_to_show:
+@@ -360,154 +434,132 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             )
+             tools_desc.append(desc)
+     
+-        return "\n".join(tools_desc)
++        result = "\n".join(tools_desc)
++        self._tools_prompt_cache, self._tools_prompt_cache_key = result, cache_key
++        return result
+     
+ 
+ 
+ 
+     def _parse_tool_call(self, content: str) -> Optional[Dict]:
++        """Parse the FIRST tool call from LLM response (backward-compatible wrapper).
++
++        Delegates to _parse_all_tool_calls and returns the first result, or None.
++        """
++        calls = self._parse_all_tool_calls(content)
++        return calls[0] if calls else None
++
++    def _parse_all_tool_calls(self, content: str) -> List[Dict]:
+         """
+-        Parse tool call from LLM response.
++        Parse ALL tool calls from LLM response (handles batch calls).
+ 
+-        Supports two text patterns:
++        Supports these text patterns:
+           1. TOOL: <name>  ARGS: {json}
+-          2. Tool/工具: <name>  Args/参数: {json}
++          2. <TOOL: name>  ARGS: {json}   (deepseek-v4-flash style, with angle brackets)
++          3. Tool/工具: <name>  Args/参数: {json}
++          4. MCP DSML XML format
++
++        When the model emits multiple TOOL blocks in one response, all are parsed
++        and returned in order. The caller (run_with_tools) executes them sequentially.
+ 
+         Args:
+             content: LLM response content
+ 
+         Returns:
+-            Tool call information or None
++            List of tool call dicts, each with "name" and "arguments".
+         """
+-        logger.debug(f"Parsing tool call from content (length={len(content)})")
++        logger.debug(f"Parsing tool calls from content (length={len(content)})")
++        calls: List[Dict] = []
+ 
+-        # ========== 【新增】解析 MCP 格式的 XML 标签 ==========
+-        # 匹配 <｜｜DSML｜｜tool_calls> ... </｜｜DSML｜｜tool_calls>
++        # ========== 1) MCP DSML XML format ==========
+         xml_pattern = re.compile(
+-            r'<｜｜DSML｜｜tool_calls>\s*(.*?)\s*</｜｜DSML｜｜tool_calls>',
++            r'<\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls>\s*(.*?)\s*</\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls>',
+             re.DOTALL
+         )
+         xml_match = xml_pattern.search(content)
+         if xml_match:
+             inner = xml_match.group(1)
+-            # 提取所有 <｜｜DSML｜｜invoke name="..."> ... </｜｜DSML｜｜invoke>
+             invoke_pattern = re.compile(
+-                r'<｜｜DSML｜｜invoke\s+name="([^"]+)"\s*>(.*?)</｜｜DSML｜｜invoke>',
++                r'<\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke\s+name="([^"]+)"\s*>(.*?)</\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke>',
+                 re.DOTALL
+             )
+             invokes = invoke_pattern.findall(inner)
+-            if invokes:
+-                # 只取第一个工具调用（简化处理）
+-                name, args_xml = invokes[0]
+-                # 提取所有 <｜｜DSML｜｜parameter name="..." ...> ... </｜｜DSML｜｜parameter> 或自闭合
++            for name, args_xml in invokes:
+                 param_pattern = re.compile(
+-                    r'<｜｜DSML｜｜parameter\s+name="([^"]+)"(?:\s+string="true")?\s*>(.*?)</｜｜DSML｜｜parameter>',
++                    r'<\uFF5C\uFF5CDSML\uFF5C\uFF5Cparameter\s+name="([^"]+)"(?:\s+string="true")?\s*>(.*?)</\uFF5C\uFF5CDSML\uFF5C\uFF5Cparameter>',
+                     re.DOTALL
+                 )
+                 params = param_pattern.findall(args_xml)
+-                args = {}
+-                for pname, pvalue in params:
+-                    args[pname] = pvalue.strip()
+-                # 如果有参数则返回
+-                if args:
+-                    logger.info(f"Parsed MCP tool call: {name} with args {args}")
+-                    return {"name": name, "arguments": args}
+-                else:
+-                    # 如果没有参数，可能是无参调用
+-                    logger.info(f"Parsed MCP tool call: {name} with no args")
+-                    return {"name": name, "arguments": {}}
+-        # ======================================================
++                args = {pname: pvalue.strip() for pname, pvalue in params}
++                calls.append({"name": name, "arguments": args})
++                logger.info(f"Parsed MCP tool call: {name} with {len(args)} args")
++            if calls:
++                return calls
+ 
+-
+-        # ===== 新增：获取当前已注册的工具名称列表 =====
++        # ========== 2) Standard TOOL: / <TOOL: > patterns ==========
+         registered_tool_names = [tool["name"] for tool in self.tools]
+ 
+-        # Two clean patterns: strict and relaxed
+-        tool_name_patterns = [
+-            r"TOOL:\s*(\w+)\s*ARGS:\s*",
+-            r"(?:Tool|工具|USE TOOL|使用工具|工具名称|TOL):\s*(\w+)\s*(?:ARGS|Args|参数|WITH ARGS|工具参数|Arguments):\s*",
++        # Regex handles: TOOL:, <TOOL:, Tool:, 工具:  with optional > after name
++        tool_start_patterns = [
++            re.compile(r"<?TOOL:\s*(\w+)\s*>?\s*ARGS:\s*", re.IGNORECASE),
++            re.compile(r"(?:Tool|工具|USE TOOL|使用工具|工具名称|TOL):\s*(\w+)\s*>?\s*(?:ARGS|Args|参数|WITH ARGS|工具参数|Arguments):\s*", re.IGNORECASE),
+         ]
+ 
+-        for pattern in tool_name_patterns:
+-            match = re.search(pattern, content, re.DOTALL)
+-            if match:
++        for pattern in tool_start_patterns:
++            for match in pattern.finditer(content):
+                 name = match.group(1)
+                 remaining = content[match.end():]
+-
+-                # Extract balanced JSON using brace counting
+                 args_str = self._extract_balanced_json(remaining)
+                 if not args_str:
++                    logger.debug(f"Found TOOL header '{name}' but no balanced JSON after it")
+                     continue
+ 
+-                logger.debug(f"Matched tool '{name}', args length={len(args_str)}")
+-
+-                # Try strict parse first, then loose
++                # Try strict JSON parse first, then loose
+                 try:
+-                    return {"name": name, "arguments": json.loads(args_str)}
++                    args = json.loads(args_str)
++                    calls.append({"name": name, "arguments": args})
++                    logger.info(f"Parsed tool call: {name} with {len(args)} args")
+                 except json.JSONDecodeError:
+                     args = parse_json(args_str)
+                     if args:
+-                        logger.info(f"Parsed tool call: {name} with {len(args)} args")
+-                        return {"name": name, "arguments": args}
++                        calls.append({"name": name, "arguments": args})
++                        logger.info(f"Parsed tool call (loose): {name} with {len(args)} args")
++                    else:
++                        logger.warning(f"Failed to parse args for {name}: {args_str[:100]}...")
+ 
+-                logger.warning(f"Failed to parse tool arguments for {name}: {args_str[:100]}...")
++            if calls:
++                return calls  # Return as soon as a pattern family matches
+ 
+-        # ---------- [NEW] 新增 fallback 解析（宽松匹配） ----------
+-        # 如果上面的严格模式都没匹配成功，尝试从内容中提取类似 "calculator({...})" 或 "calculator: {...}" 的格式
++        # ========== 3) Fallback: func({...}) / func: {...} ==========
+         fallback_patterns = [
+-            r'(\w+)\s*\(\s*(\{.*?\})\s*\)',          # 匹配 func({...})
+-            r'(\w+)[：:]\s*(\{.*\})',                # 匹配 func: {...}  或 func：{...}
+-            r'(\w+)\s*\(\s*([^)]*)\)',               # 匹配 func(key=value, ...)  —— 这种可能不是 JSON，先提取再尝试构造
++            r'(\w+)\s*\(\s*(\{.*?\})\s*\)',
++            r'(\w+)[：:]\s*(\{.*\})',
++            r'(\w+)\s*\(\s*([^)]*)\)',
+         ]
+-
+         for pattern in fallback_patterns:
+             match = re.search(pattern, content, re.DOTALL)
+             if match:
+                 name = match.group(1)
+                 args_candidate = match.group(2).strip()
+-
+-                # ========== 【新增：防止误解析】 ==========
+-                # 只有提取的名称确实是已注册的工具时，才继续处理
+-                # 否则直接跳过，避免将普通文本（如 "我猜是 python(3.8)"）误判为工具调用
+                 if name not in registered_tool_names:
+-                    logger.debug(f"Fallback ignored '{name}' - not a registered tool.")
+                     continue
+-                # ===========================================
+-
+-                # 尝试补全为合法 JSON
+-                if not args_candidate.startswith('{'):
+-                    # 如果内容是 "key=value, key2=value2" 这种，尝试转为 JSON 对象
+-                    # 这里简单处理：如果它看起来像 JSON，直接解析；否则尝试用 parse_json 工具
+-                    pass
+-                # 优先尝试作为 JSON 解析
+                 try:
+-                    # 如果缺少花括号，补上
+                     if not args_candidate.startswith('{'):
+                         args_candidate = '{' + args_candidate + '}'
+                     args = json.loads(args_candidate)
+-                    logger.info(f"Parsed tool call via fallback: {name} with {len(args)} args")
+-                    return {"name": name, "arguments": args}
++                    calls.append({"name": name, "arguments": args})
++                    return calls
+                 except json.JSONDecodeError:
+-                    # 如果还是失败，使用已有的 parse_json 宽松解析
+                     args = parse_json(args_candidate)
+                     if args:
+-                        logger.info(f"Parsed tool call via fallback (loose): {name} with {len(args)} args")
+-                        return {"name": name, "arguments": args}
+-                # 如果上述都失败，继续尝试下一个 fallback 模式
+-                continue
+-
+-
+-        # ---------- 原有结尾（保持不变） ----------
+-    
+-            logger.debug("No tool call pattern matched")
++                        calls.append({"name": name, "arguments": args})
++                        return calls
+ 
+-        
+-        # 如果所有解析尝试都失败，判断是否包含明确的工具指示词
+-        if re.search(r'TOOL:|工具:', content, re.IGNORECASE):
++        # ========== Warning if TOOL: was present but nothing parsed ==========
++        if not calls and re.search(r'</?TOOL:|工具:', content, re.IGNORECASE):
+             console.print(f"[dim]⚠️ 无法解析的工具调用内容(前200字符): {content[:200]}[/dim]")
+ 
+-        # 否则，静默返回 None（不输出任何警告）
+-        return None
++        return calls
+         
+ 
+ 
+@@ -631,12 +683,17 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         return messages
+ 
+     @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=60))
+-    def _call_llm(self, messages: List[Dict[str, str]]) -> str:
++    def _call_llm(self, messages: List[Dict[str, str]], temperature: Optional[float] = None,
++                  reflect: bool = True) -> str:
+         """
+         Call LLM with messages
+         
+         Args:
+             messages: Conversation messages
++            temperature: Override temperature (None → self.temperature).
++                The skill router passes 0.0 for a deterministic decision.
++            reflect: Whether to run the reflector on this call. The skill router
++                passes False to keep the routing call cheap and deterministic.
+             
+         Returns:
+             LLM response content
+@@ -652,12 +709,13 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+                 raise ValueError("API key is not set. Please check your environment variables.")
+             
+             # Apply reflection if enabled
+-            messages = self._maybe_reflect(messages)
++            if reflect:
++                messages = self._maybe_reflect(messages)
+                 
+             response = self.client.chat.completions.create(
+                 model=self.model,
+                 messages=messages,
+-                temperature=self.temperature
++                temperature=self.temperature if temperature is None else temperature
+             )
+             content = response.choices[0].message.content
+             elapsed = time.perf_counter() - start  # <--- 计算耗时
+@@ -743,25 +801,6 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         recent = messages[-keep_last:]
+         
+ 
+-        '''
+-        # Build a compact summary of old conversation
+-        summary_parts = []
+-        for m in old_messages:
+-            role = m.get("role", "")
+-            content = (m.get("content", "") or "")[:300]   # 从200增加到300
+-            if role == "user":
+-                summary_parts.append(f"User asked: {content}")
+-            elif role == "assistant":
+-                summary_parts.append(f"Assistant: {content}")
+-            elif role == "tool":
+-                summary_parts.append(f"Tool result: {content}")
+-        
+-        summary = "\n".join(summary_parts[-10:])  # keep last 10 entries in summary
+-        summary_msg = {
+-            "role": "user",
+-            "content": f"[Conversation summary - {len(old_messages)} earlier messages compressed]\n{summary}\n[End of summary. Continue from here.]"
+-        }
+-        '''
+ 
+         # ========== 改进点 1：限制摘要条目数，防止摘要过长 ==========
+         # 最多保留最近 15 条旧消息做摘要，避免压缩本身产生大量 token
+@@ -813,24 +852,49 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+     def _check_dangerous(self, tool_call: Dict) -> bool:
+         """
+-        Check if a tool call is potentially dangerous and needs confirmation.
+-        
++        Check if a tool call needs user confirmation before execution.
++
++        Two independent confirmation gates:
++        1. write / edit —— 文件写入确认（confirm_file_writes，默认开启）。
++           模型不得在用户同意前创建或修改文件。
++        2. bash —— 危险命令确认（confirm_dangerous，需显式开启）。
++
+         Returns True if the call is safe to proceed, False if user rejected.
+         """
++        name = tool_call.get("name")
++        args = tool_call.get("arguments", {})
++
++        # ---- 文件写入确认 ----
++        if name in ("write", "edit"):
++            if not self.confirm_file_writes:
++                return True
++            path = str(args.get("path", "?"))
++            action = "写入文件" if name == "write" else "修改文件"
++            desc = f"{action} {path}"
++            if self.confirm_callback:
++                return self.confirm_callback(desc)
++            # Default: stdin prompt
++            try:
++                answer = input(f"\n⚠️ 即将{desc}，是否继续？[y/N]: ").strip().lower()
++                return answer in ("y", "yes")
++            except (EOFError, KeyboardInterrupt):
++                return False
++
++        # ---- 危险 bash 命令确认 ----
+         if not self.confirm_dangerous:
+             return True
+-        
+-        if tool_call["name"] != "bash":
++
++        if name != "bash":
+             return True
+-        
+-        cmd = tool_call.get("arguments", {}).get("cmd", "")
++
++        cmd = str(args.get("cmd", ""))
+         if not _DANGEROUS_RE.search(cmd):
+             return True
+-        
++
+         # Ask for confirmation
+         if self.confirm_callback:
+             return self.confirm_callback(cmd)
+-        
++
+         # Default: stdin prompt
+         try:
+             answer = input(f"\n⚠️  Dangerous command detected: {cmd}\nAllow execution? [y/N]: ").strip().lower()
+@@ -869,16 +933,20 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+     
+ 
+-    def _build_dynamic_system_prompt(self) -> str:
+-        """根据当前加载的技能动态构建系统提示词"""
++    def _build_dynamic_system_prompt(self, mode: str = "text") -> str:
++        """根据当前加载的技能动态构建系统提示词
+ 
++        Args:
++            mode: "text" 或 "native"，决定使用哪个模板
++        """
+         base = self._loaded_skill.prompt if self._loaded_skill else self.system_prompt
+         if self._loaded_skill:
+             console.print(f"[dim]📄 Using SKILL PROMPT: {self._loaded_skill.name}[/dim]")
+         else:
+             console.print(f"[dim]📄 Using DEFAULT SYSTEM PROMPT (no skill loaded)[/dim]")
+ 
+-        return self._TEXT_MODE_PROMPT.format(
++        template = self._NATIVE_MODE_PROMPT if mode == "native" else self._TEXT_MODE_PROMPT
++        return template.format(
+             base_prompt=base,
+             tools_prompt=self._build_tools_prompt(),
+         )
+@@ -892,13 +960,262 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         初始化每次运行的公共环境：重置技能状态、初始化消息列表、获取限制参数
+         """
+         self._reset_skill_state()
++        # ===== 自动路由：根据用户提问自动加载匹配的 skill =====
++        if self.auto_route_skills:
++            self._auto_route_skill(query)
+         logger.info(f"Starting query: {query[:50]}...")
++
++        # ===== 字数约束：从 query 解析（如 "800字" / "2000 words"）并强注入 =====
++        self._length_constraint = self._extract_length_constraint(query)
++        user_content = query
++        if self._length_constraint:
++            target, is_words = self._length_constraint
++            unit = "words" if is_words else "字"
++            user_content = (
++                query
++                + f"\n\n[长度要求] 用户明确要求约 {target} {unit}。"
++                + f"最终回答必须控制在 {target} {unit} 左右（允许 ±15%，即 "
++                + f"{int(target * 0.85)}–{int(target * 1.15)} {unit}），"
++                + "严禁写成远超要求的长文。字数按"
++                + ("英文单词数" if is_words else "汉字+标点字符数（不含空格）")
++                + "统计。内容过多时宁可精简到核心要点，也不要超长。"
++            )
++
+         messages = [
+             {"role": "system", "content": ""},  # 占位，每轮动态更新
+-            {"role": "user", "content": query}
++            {"role": "user", "content": user_content}
+         ]
+         return messages, self._max_context_messages, self._tool_result_limit
+ 
++    @staticmethod
++    def _extract_length_constraint(query: str):
++        """从用户 query 中提取字数/词数要求。
++
++        支持：800字 / 800个字 / 2000 字 / 500 words / 800词 / 3000字符
++        返回 (target, is_words) 或 None。is_words=True 表示按英文单词数统计。
++        """
++        m = re.search(
++            r"(\d{2,6})\s*(?:个)?\s*(?:汉字|中文字|字|词|字符|words?|chars?)",
++            query,
++            re.IGNORECASE,
++        )
++        if not m:
++            return None
++        target = int(m.group(1))
++        if target < 20:  # 过滤噪音（如版本号、编号后跟"字"）
++            return None
++        unit = m.group(0)
++        is_words = "word" in unit.lower() or "词" in unit
++        return target, is_words
++
++    @staticmethod
++    def _text_length(text: str, is_words: bool) -> int:
++        """统计文本长度：英文按单词数，中文按去空格后的字符数。"""
++        if is_words:
++            return len(text.split())
++        return len(re.sub(r"\s+", "", text))
++
++    @staticmethod
++    def _truncate_to_length(text: str, max_len: int, is_words: bool) -> str:
++        """在句子/段落边界把文本截断到目标长度（兜底用，不破坏 markdown 结构）。"""
++        if is_words:
++            words = text.split()
++            if len(words) <= max_len:
++                return text
++            return " ".join(words[:max_len]).rstrip("，。；、,.?! \n") + "…"
++        if len(re.sub(r"\s+", "", text)) <= max_len:
++            return text
++        sents = re.split(r"(?<=[。！？!?；;])", text)
++        acc, acc_len = "", 0
++        for s in sents:
++            n = acc_len + len(re.sub(r"\s+", "", s))
++            if acc and n > max_len:
++                break
++            acc += s
++            acc_len = n
++        acc = acc.rstrip()
++        if not acc:
++            return re.sub(r"\s+", "", text)[:max_len] + "…"
++        return acc + "\n\n…（已按字数要求截断）"
++
++    def _finalize_response(self, response: str, query: str, messages: List[Dict]) -> str:
++        """按用户字数要求收尾：明显超长时追加一轮压缩（一次额外 LLM 调用）。
++
++        压缩后仍超长时用句子边界截断兜底。无字数要求时原样返回。
++        """
++        constraint = getattr(self, "_length_constraint", None)
++        if not constraint:
++            return response
++        target, is_words = constraint
++        unit = "words" if is_words else "字"
++        cur = self._text_length(response, is_words)
++        if cur <= target * 1.15:
++            return response
++
++        console.print(f"[dim]📏 回答约 {cur} {unit}，超出要求 {target} {unit}，正在压缩…[/dim]")
++        # 把待压缩原文放进消息，保证模型能看到（FINAL_ANSWER 分支的回答尚未进入历史）
++        if len(response) <= 8000:
++            comp_msg = (
++                f"用户只要求约 {target} {unit}（允许 ±15%），但你刚才的回答约 {cur} {unit}，超长了。\n"
++                f"请将下面的回答压缩到 {target} {unit} 左右（{int(target * 0.85)}–{int(target * 1.15)} {unit}），"
++                f"保留核心观点与必要引用，删掉冗余展开和重复表述，保持结构完整。\n\n"
++                f"=== 待压缩的回答 ===\n{response}\n=== 结束 ===\n\n"
++                f"直接输出压缩后的最终回答，并以 FINAL_ANSWER: 开头，不要再调用任何工具。"
++            )
++        else:
++            comp_msg = (
++                f"你刚才的回答约 {cur} {unit}，但用户只要求约 {target} {unit}（±15%）。"
++                f"请把回答压缩到 {target} {unit} 左右（{int(target * 0.85)}–{int(target * 1.15)} {unit}），"
++                f"保留核心观点与必要引用，删掉冗余展开和重复表述，保持结构完整。"
++                f"直接输出压缩后的最终回答，并以 FINAL_ANSWER: 开头，不要再调用任何工具。"
++            )
++        messages.append({"role": "user", "content": comp_msg})
++        try:
++            final = self._call_llm(messages, temperature=0.0)
++            if final.strip().startswith("FINAL_ANSWER:"):
++                final = final[len("FINAL_ANSWER:"):].strip()
++            if self._text_length(final, is_words) > target * 1.3:
++                return self._truncate_to_length(final, int(target * 1.2), is_words)
++            return final
++        except Exception as e:
++            logger.warning(f"Length compression failed ({e}); truncating instead")
++            return self._truncate_to_length(response, int(target * 1.2), is_words)
++
++    def _route_skill_via_llm(self, query: str):
++        """
++        把 skill 列表 + 用户问题交给大模型，让模型基于语义决定用哪个 skill（或不用）。
++
++        Returns:
++            (skill, explicit_none): skill 为命中的 Skill 或 None；
++            explicit_none=True 表示模型明确回答 "none"（应当尊重，不再回退评分系统）；
++            explicit_none=False 且 skill=None 表示模型回答无法解析或给了未知名字，
++            调用方应回退到评分系统。
++        传输/API 异常会向上抛出，由调用方统一兜底。
++        """
++        from .skills import _SKILLS
++        if not _SKILLS:
++            return None, False
++
++        lines = []
++        for name, skill in sorted(_SKILLS.items(), key=lambda kv: kv[0]):
++            desc = (skill.description or "").replace("\n", " ").strip()
++            if len(desc) > 160:
++                desc = desc[:160] + "…"
++            line = f"- {name}: {desc}"
++            if skill.keywords:
++                line += f" | keywords: {', '.join(skill.keywords[:8])}"
++            lines.append(line)
++        listing = "\n".join(lines)
++
++        prompt = (
++            "You are a skill router. Given the user request below and the list of available "
++            "skills, decide which ONE skill should handle it. If NO skill fits, answer 'none'.\n\n"
++            f"Available skills:\n{listing}\n\n"
++            "Rules:\n"
++            "- Choose by semantic INTENT, not by surface keywords.\n"
++            "- If the user wants to reduce AI flavor / humanize a paper's writing → the "
++            "humanization skill, never a coding skill.\n"
++            "- 'use the appropriate ccfa skill' is a meta instruction meaning 'pick the right "
++            "one' — it is NOT a request to create a skill.\n"
++            "- Generic chat or simple Q&A that no skill clearly fits → 'none'.\n"
++            "- Only pick from the listed skill names; never invent new ones.\n\n"
++            f"User request: {query}\n\n"
++            "Reply with exactly one line, nothing else:\n"
++            "SKILL: <name>\n"
++            "or\n"
++            "SKILL: none"
++        )
++        logger.info("LLM routing: sending skill list to model for decision")
++        resp = self._call_llm(
++            [{"role": "user", "content": prompt}],
++            temperature=0.0,
++            reflect=False,
++        )
++        text = (resp or "").strip()
++
++        m = re.search(r"(?:SKILL|skill|技能|工具)\s*[:：]\s*([A-Za-z0-9_\-\.]+)", text)
++        if not m:
++            logger.warning(f"LLM routing: unparseable response {text[:120]!r}; falling back to scoring")
++            return None, False
++        raw = m.group(1).strip().lower()
++        if raw in ("none", "null", "无", "没有"):
++            logger.info("LLM routing: model decided no skill matches; not routing")
++            return None, True
++
++        # 精确/去分隔符匹配 skill 名（ccf-humanization / literature_reviewer 等）
++        norm = lambda s: s.lower().replace("_", "").replace("-", "").replace(".", "")
++        for name, skill in _SKILLS.items():
++            if norm(name) == norm(raw):
++                logger.info(f"LLM routing: model picked '{name}'")
++                return skill, False
++
++        logger.warning(f"LLM routing: model picked unknown skill {raw!r}; falling back to scoring")
++        return None, False
++
++    def _auto_route_skill(self, query: str):
++        """
++        根据用户提问自动加载最匹配的 skill（无需用户显式提及，也无需 LLM 自觉调用 use_skill）。
++
++        路由策略（LLM 路由为主，评分系统兜底）：
++        1. 确保 CCFA 技能家族已加载（env 设置了 CCFA_SKILLS_ROOT 但尚未注册时懒加载）——
++           否则路由只在内置 skill 里选，"用ccfa skills里相应的skill" 会错误路由到 coder
++        2. 若 llm_route_skills 开启：把 skill 列表 + 用户问题交给模型，由模型基于语义决策：
++           - 模型明确选某个 skill → 用之
++           - 模型明确说 none → 不路由（尊重判断，"不匹配任何一个skill就别用"）
++           - 模型回答无法解析/API 异常 → 回退到评分系统
++        3. 评分系统（关键词/描述/动作动词打分）作为兜底
++
++        返回加载的 Skill 或 None。
++        """
++        from .skills import match_skill
++
++        self._ensure_ccfa_loaded()
++
++        skill = None
++        if self.llm_route_skills:
++            try:
++                skill, explicit_none = self._route_skill_via_llm(query)
++                if explicit_none:
++                    console.print("[dim]🧭 LLM router: no skill matches, not routing[/dim]")
++                    logger.info("LLM router decided no skill matches; not routing")
++                    return None
++            except Exception as e:
++                logger.warning(f"LLM routing failed ({e}); falling back to scoring system")
++                skill = None
++
++        if skill is None:
++            skill = match_skill(query)
++        if skill is None:
++            return None
++
++        self._loaded_skill = skill
++        self._skill_tool_whitelist = skill.tools
++        if skill.temperature is not None:
++            self.temperature = skill.temperature
++        console.print(f"[dim]🎯 AUTO-ROUTED to skill: '{skill.name}' (from query)[/dim]")
++        logger.info(f"Auto-routed to skill: {skill.name}")
++        return skill
++
++    @staticmethod
++    def _ensure_ccfa_loaded():
++        """若设置了 CCFA_SKILLS_ROOT 且 CCFA 家族尚未注册，则懒加载。
++
++        避免"路由发生在 load_ccfa_skills() 之前"导致的漏加载——
++        此时 match_skill 只在内置 skill 里选，CCFA 场景会错误路由到 coder。
++        """
++        import os as _os
++        from .skills import _SKILLS
++
++        if not _os.environ.get("CCFA_SKILLS_ROOT"):
++            return
++        if any(name.startswith("ccf-") for name in _SKILLS):
++            return
++        try:
++            from .ccfa_loader import load_ccfa_skills
++            load_ccfa_skills()
++        except Exception as e:  # 加载失败不阻断主流程
++            logger.warning(f"CCFA skills 懒加载失败: {e}")
++
+ 
+ 
+     def _force_final_answer(self, messages: List[Dict], max_iterations: int) -> str:
+@@ -942,7 +1259,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             messages = self._compress_if_needed(messages, max_ctx)
+ 
+             # ===== 动态更新 system prompt =====
+-            system_content = self._build_dynamic_system_prompt()
++            system_content = self._build_dynamic_system_prompt(mode="text")
+             messages[0] = {"role": "system", "content": system_content}
+ 
+             if status_callback:
+@@ -960,19 +1277,21 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+             # 检测 FINAL_ANSWER
+             if response.strip().startswith("FINAL_ANSWER:"):
+-                return response[len("FINAL_ANSWER:"):].strip()
++                return self._finalize_response(
++                    response[len("FINAL_ANSWER:"):].strip(), query, messages
++                )
+ 
+             messages.append({"role": "assistant", "content": response})
+ 
+-            # 解析工具调用
+-            tool_call = self._parse_tool_call(response)
++            # 解析工具调用（支持多个，模型可能一次输出多个 TOOL 块）
++            tool_calls = self._parse_all_tool_calls(response)
+ 
+             # 无工具调用
+-            if not tool_call:
+-                # 启发式判断：若响应足够长且无“未完成”暗示，视为完成
++            if not tool_calls:
++                # 启发式判断：若响应足够长且无"未完成"暗示，视为完成
+                 if len(response) > 100 and not any(kw in response for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]):
+                     logger.info("No tool call but response seems complete, returning.")
+-                    return response
++                    return self._finalize_response(response, query, messages)
+                 # 否则引导
+                 messages.append({
+                     "role": "user",
+@@ -980,40 +1299,33 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+                 })
+                 continue  # 下一轮
+ 
+-            
+-            # 处理 use_skill
+-            if tool_call["name"] == "use_skill":
+-                result_str = self._use_skill_handler(**tool_call["arguments"])
+-                messages.append({
+-                    "role": "user",
+-                    "content": f"工具 '{tool_call['name']}' 执行结果：{result_str}"
+-                })
+-                continue  # 下一轮，此时 _loaded_skill 已更新
+-            
+-
++            # 依次执行所有工具调用
++            for tool_call in tool_calls:
++                # 处理 use_skill
++                if tool_call["name"] == "use_skill":
++                    result_str = self._use_skill_handler(**tool_call["arguments"])
++                    messages.append({
++                        "role": "user",
++                        "content": f"工具 '{tool_call['name']}' 执行结果：{result_str}"
++                    })
++                    continue  # 下一个工具
+ 
+-            # 执行其他工具
+-            result_str, rejected = self._safe_execute_tool(tool_call, tool_callback, status_callback, limit)
++                # 执行其他工具
++                result_str, rejected = self._safe_execute_tool(tool_call, tool_callback, status_callback, limit)
+ 
+-            if rejected:
+-                feedback = f"用户拒绝了工具 '{tool_call['name']}'，请建议安全的替代方案或用中文回答。"
+-            elif isinstance(result_str, str) and ("Error" in result_str or "Exception" in result_str):
+-                feedback = f"工具 '{tool_call['name']}' 出错：{result_str}\n请解释错误并给出解决方案。"
+-            else:
+-                feedback = f"工具 '{tool_call['name']}' 结果：{result_str}\n请继续用中文回答，完成时以 FINAL_ANSWER: 开头。"
++                if rejected:
++                    feedback = f"用户拒绝了工具 '{tool_call['name']}'，请建议安全的替代方案或用中文回答。"
++                elif isinstance(result_str, str) and ("Error" in result_str or "Exception" in result_str):
++                    feedback = f"工具 '{tool_call['name']}' 出错：{result_str}\n请解释错误并给出解决方案。"
++                else:
++                    feedback = f"工具 '{tool_call['name']}' 结果：{result_str}\n请继续用中文回答，完成时以 FINAL_ANSWER: 开头。"
+ 
+-            messages.append({"role": "user", "content": feedback})
++                messages.append({"role": "user", "content": feedback})
+ 
+-        # 超出迭代次数，强制生成最终答案
+-        logger.warning(f"Reached maximum iterations ({max_iterations})")
+-        messages.append({
+-            "role": "user",
+-            "content": "你已尝试多次工具调用，请根据所有已知信息，用中文给出最终答案，并以 FINAL_ANSWER: 开头。"
+-        })
+-        final = self._call_llm(messages)
+-        if final.strip().startswith("FINAL_ANSWER:"):
+-            return final[len("FINAL_ANSWER:"):].strip()
+-        return final
++        # 超出迭代次数，强制生成最终答案（复用 _force_final_answer，避免重复逻辑）
++        return self._finalize_response(
++            self._force_final_answer(messages, max_iterations), query, messages
++        )
+ 
+ 
+ 
+@@ -1035,8 +1347,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         for iteration in range(max_iterations):
+             messages = self._compress_if_needed(messages, max_ctx)
+ 
+-            # 动态更新 system
+-            system_content = self._build_dynamic_system_prompt()
++            # 动态更新 system（native 模式使用独立模板，不再要求文本 TOOL: 格式）
++            system_content = self._build_dynamic_system_prompt(mode="native")
+             messages[0] = {"role": "system", "content": system_content}
+ 
+             if status_callback:
+@@ -1068,11 +1380,23 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+             # 检测 FINAL_ANSWER
+             if msg.content and msg.content.strip().startswith("FINAL_ANSWER:"):
+-                return msg.content[len("FINAL_ANSWER:"):].strip()
++                return self._finalize_response(
++                    msg.content[len("FINAL_ANSWER:"):].strip(), query, messages
++                )
+ 
+-            # 无工具调用，直接返回内容（可能已经回答）
++            # 无工具调用：与 text 模式保持一致，判断响应是否完整
+             if not msg.tool_calls:
+-                return msg.content or ""
++                content = (msg.content or "").strip()
++                # 响应足够长且无"未完成"暗示 → 视为完成
++                if len(content) > 100 and not any(kw in content for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]):
++                    return self._finalize_response(content, query, messages)
++                # 否则引导 LLM 继续（把本轮回复加入历史，避免原地打转）
++                messages.append(msg)
++                messages.append({
++                    "role": "user",
++                    "content": "当前回复没有工具调用且不完整。请调用工具获取信息，或如果已足够，请以 FINAL_ANSWER: 开头给出最终回答。"
++                })
++                continue
+ 
+             messages.append(msg)
+ 
+@@ -1109,7 +1433,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+ 
+         # ===== 替换结尾的强制回答代码（现在统一使用 _call_llm） =====
+-        return self._force_final_answer(messages, max_iterations)
++        return self._finalize_response(
++            self._force_final_answer(messages, max_iterations), query, messages
++        )
+ 
+ 
+ 
+diff --git a/miniagent/cli.py b/miniagent/cli.py
+index 43efc7b..7cfc06d 100644
+--- a/miniagent/cli.py
++++ b/miniagent/cli.py
+@@ -29,6 +29,10 @@ logger = get_logger(__name__)
+ 
+ console = Console()
+ 
++# 完整输出模式：不折叠最终回答，完整显示工具参数/结果。
++# 环境变量 MINIAGENT_FULL_OUTPUT=1 开启，交互中可用 /full 切换。
++_FULL_OUTPUT = os.environ.get("MINIAGENT_FULL_OUTPUT", "0").lower() not in ("0", "false", "no")
++
+ def _format_history(history: List[Dict[str, str]], limit_turns: int = 10) -> str:
+     if not history:
+         return ""
+@@ -46,6 +50,8 @@ def _format_history(history: List[Dict[str, str]], limit_turns: int = 10) -> str
+ 
+ def _truncate_str(s: str, limit: int = 60) -> str:
+     """Truncate a string for display."""
++    if _FULL_OUTPUT:
++        limit = max(limit, 2000)
+     if len(s) > limit:
+         return s[:limit] + "…"
+     return s
+@@ -55,7 +61,7 @@ def _format_tool_args(name: str, args: Dict[str, Any]) -> str:
+     """Format tool arguments for concise display (Claude Code style)."""
+     if name == "bash":
+         cmd = args.get("cmd", args.get("command", ""))
+-        return _truncate_str(cmd, 80)
++        return _truncate_str(cmd, 120)
+     elif name == "read":
+         path = args.get("path", "")
+         offset = args.get("offset", 1)
+@@ -79,7 +85,7 @@ def _format_tool_args(name: str, args: Dict[str, Any]) -> str:
+         # Generic: show first key-value pair
+         if args:
+             first_key = next(iter(args))
+-            return f"{first_key}={_truncate_str(str(args[first_key]), 50)}"
++            return f"{first_key}={_truncate_str(str(args[first_key]), 120)}"
+         return ""
+ 
+ 
+@@ -133,10 +139,11 @@ def _tool_callback(event: str, name: str, payload: Dict[str, Any]) -> None:
+         result = payload.get("result", payload.get("error"))
+         result_str = _format_tool_result(name, result)
+         
+-        # Only print result if it's meaningful and short
+-        if result_str and result_str != "✓" and len(result_str) < 100:
++        # Only print result if it's meaningful and short (full mode shows more)
++        max_result_len = 500 if _FULL_OUTPUT else 100
++        if result_str and result_str != "✓" and len(result_str) < max_result_len:
+             # Indent result under the tool call
+-            for line in result_str.split("\n")[:3]:  # Max 3 lines
++            for line in result_str.split("\n")[:8]:  # Max 8 lines
+                 console.print(f"    [dim]→ {line}[/dim]")
+         
+         # Restore status
+@@ -179,11 +186,11 @@ def _build_agent(args: argparse.Namespace) -> tuple[MiniAgent, Memory]:
+     if mem_ctx:
+         system_prompt = system_prompt.rstrip() + "\n\n" + mem_ctx
+ 
+-    def _confirm_dangerous(cmd: str) -> bool:
+-        """Rich-formatted confirmation for dangerous commands."""
+-        console.print(f"\n  [bold red]⚠️  Dangerous command detected:[/bold red]")
+-        console.print(f"  [yellow]{cmd}[/yellow]")
+-        answer = Prompt.ask("  [bold]Allow execution?[/bold]", choices=["y", "n"], default="n")
++    def _confirm_dangerous(desc: str) -> bool:
++        """Rich-formatted confirmation for dangerous commands / file writes."""
++        console.print(f"\n  [bold red]⚠️ 需要确认的操作:[/bold red]")
++        console.print(f"  [yellow]{desc}[/yellow]")
++        answer = Prompt.ask("  [bold]是否允许执行?[/bold]", choices=["y", "n"], default="n")
+         return answer.lower() == "y"
+ 
+     agent = MiniAgent(
+@@ -203,6 +210,15 @@ def _build_agent(args: argparse.Namespace) -> tuple[MiniAgent, Memory]:
+     for tool_name in tools:
+         agent.load_builtin_tool(tool_name)
+ 
++    # ===== 加载 CCFA-Skills 技能家族（可选，设置 CCFA_SKILLS_ROOT 环境变量启用）=====
++    import os as _os
++    if _os.environ.get("CCFA_SKILLS_ROOT"):
++        try:
++            from .ccfa_loader import load_ccfa_skills
++            load_ccfa_skills()
++        except Exception as e:
++            console.print(f"[dim]⚠️ CCFA skills 加载失败: {e}[/dim]")
++
+     return agent, memory
+ 
+ 
+@@ -390,16 +406,22 @@ def main(argv: Optional[List[str]] = None) -> int:
+                 run_mode = "native" if run_mode == "text" else "text"
+                 console.print(f"[dim]mode: {run_mode}[/dim]")
+                 continue
++            if user_text == "/full":
++                global _FULL_OUTPUT
++                _FULL_OUTPUT = not _FULL_OUTPUT
++                console.print(f"[dim]full output: {'on' if _FULL_OUTPUT else 'off'}[/dim]")
++                continue
+             if user_text in ("/help", "help"):
+                 console.print("[bold]Commands:[/bold]")
+                 console.print("  /help    show this help")
+                 console.print("  /c       clear conversation history")
+                 console.print("  /stream  toggle streaming output")
++                console.print("  /full    toggle full output (no folding)")
+                 console.print("  /model   switch LLM model")
+                 console.print("  /mode    toggle text/native FC mode")
+                 console.print("  /tools   list loaded tools")
+                 console.print("  /q       quit")
+-                console.print(f"\n[dim]model: {agent.model} | mode: {run_mode} | streaming: {'on' if use_streaming else 'off'} | tools: {len(agent.tools)}[/dim]")
++                console.print(f"\n[dim]model: {agent.model} | mode: {run_mode} | streaming: {'on' if use_streaming else 'off'} | full: {'on' if _FULL_OUTPUT else 'off'} | tools: {len(agent.tools)}[/dim]")
+                 continue
+             if user_text == "/tools":
+                 console.print(f"[bold]Loaded Tools ({len(agent.tools)}):[/bold]")
+@@ -467,9 +489,11 @@ def main(argv: Optional[List[str]] = None) -> int:
+                 console.print()  # newline after streamed output
+                 continue
+ 
+-            # Truncate overly long responses for display (keep full in history)
++            # Truncate overly long responses for display (keep full in history).
++            # 折叠阈值默认 20000 字符（原先 2000 会把中等长度回答拦腰截断）；
++            # /full 或 MINIAGENT_FULL_OUTPUT=1 时完全不折叠。
+             display_response = response
+-            if len(response) > 2000:
++            if not _FULL_OUTPUT and len(response) > 20000:
+                 # Count lines and truncate if too long
+                 lines = response.split('\n')
+                 if len(lines) > 50:
+diff --git a/miniagent/skills.py b/miniagent/skills.py
+index 6388b8e..a467512 100644
+--- a/miniagent/skills.py
++++ b/miniagent/skills.py
+@@ -26,6 +26,7 @@ Example usage:
+ 
+ from __future__ import annotations
+ 
++import re
+ from dataclasses import dataclass, field
+ from typing import Dict, List, Optional
+ 
+@@ -42,6 +43,8 @@ class Skill:
+     temperature: Optional[float] = None
+     max_iterations: Optional[int] = None
+     description: str = ""
++    # 路由关键词：命中用户提问即自动加载该 skill（解决"不能自主选择 skill"问题）
++    keywords: List[str] = field(default_factory=list)
+ 
+ 
+ def register_skill(skill: Skill) -> Skill:
+@@ -60,6 +63,210 @@ def register_skill(skill: Skill) -> Skill:
+     return skill
+ 
+ 
++def _split_terms(text: str) -> tuple[set, set]:
++    """把文本拆成英文单词集合 + 中文短语集合（用于匹配打分）。
++
++    注意：不能依赖 re 的 \\b——中文也属于 \\w，\\b 在中英边界不生效。
++    """
++    en = set(re.findall(r"[a-zA-Z][a-zA-Z-]{1,30}", text.lower()))
++    cn = set()
++    for part in re.split(r"[，,；;。：:\s]+", text):
++        part = part.strip()
++        if part and re.search(r"[\u4e00-\u9fff]", part):
++            cn.add(part)
++    return en, cn
++
++
++def _cn_2grams(text: str) -> set:
++    """提取文本中所有连续的两个汉字（中文 bigram）。"""
++    grams = set()
++    for i in range(len(text) - 1):
++        g = text[i:i + 2]
++        if re.fullmatch(r"[\u4e00-\u9fff]{2}", g):
++            grams.add(g)
++    return grams
++
++
++def _kw_candidates(kw: str) -> set:
++    """英文单词关键词的匹配候选：原词 + 常见单复数变体。
++
++    例：kw="rebuttals" 时 query 里出现 "rebuttal" 也能命中。
++    """
++    c = {kw}
++    if kw.endswith("s"):
++        c.add(kw[:-1])
++    else:
++        c.add(kw + "s")
++        c.add(kw + "es")
++    return c
++
++
++# 常见中文动作字（用于"动词首字命中"：query 含触发词的动作字 → 弱信号）
++_CN_VERB_CHARS = set(
++    "写改润审查搜优监回检提压缩绘设规拆打比转核找调评校验测试编跑修删增补读看"
++    "研究探索跟追复投汇总列排分析整理清除扫描备份恢复导出录询部署发布构建译选筛"
++)
++
++# 英文"元词"：指代技能体系本身的词（ccfa skills / skill / codex），在 query 中出现
++# 只是名词性泛指，不代表任何具体动作，命中无区分度。英文交集计分时剔除。
++# 例："用ccfa skills里相应的skill来去ai味" 会让 ccf-skill-forger 靠
++# "ccfa/skills/skill" 巧合得 5 分（它是造 skill 的，description 全是这类词），
++# 而真正的意图（去 AI 味）对应的 ccf-humanization 只有 2 分。
++_LOW_DISC_EN = {"ccfa", "ccf", "skill", "skills", "codex"}
++
++# 英文停用词：query/description 里无区分度的功能词。英文交集计分时剔除——
++# 例："search the web for AI funding news" 若不剔除，ccf-literature-searcher 会靠
++# description 里的 "for"/"the" 各 +1 而误胜出（researcher 只有 search/web 两个真词）。
++_EN_STOPWORDS = {
++    "the", "a", "an", "and", "or", "but", "for", "with", "use", "using", "used",
++    "when", "does", "do", "not", "are", "is", "am", "be", "been", "being", "was",
++    "were", "you", "your", "yours", "own", "its", "it", "this", "that", "these",
++    "those", "from", "into", "main", "maintain", "maintaining", "only", "full",
++    "before", "after", "keep", "keeping", "preserve", "creating", "create",
++    "requested", "they", "them", "their", "will", "would", "can", "could", "may",
++    "might", "must", "should", "shall", "while", "where", "which", "who", "whom",
++    "what", "when", "why", "how", "all", "any", "each", "every", "both", "some",
++    "such", "than", "then", "there", "here", "also", "even", "still", "etc", "via",
++    "per", "within", "without", "between", "under", "over", "about", "against",
++    "during", "among", "toward", "new", "your", "my", "me", "we", "us", "our",
++}
++
++# 强意图正则 → 直接命中的 skill。这类短语语义唯一、无歧义，命中即返回，
++# 不再参与打分（避免被其他 skill 的巧合命中顶掉）。
++_HARD_INTENTS = [
++    # 去 AI 味 → ccf-humanization（description: "Humanize and de-defend ... AI-like risk narration"）
++    (re.compile(r"去+\s*[aA]+\s*[iI]+\s*味|降\s*[aA]+\s*[iI]+\s*味|去\s*机\s*器\s*味|humaniz\w*", re.IGNORECASE),
++     "ccf-humanization"),
++]
++
++
++def match_skill(query: str) -> Optional[Skill]:
++    """根据用户提问自动匹配最合适的 skill（打分制，消除短名/关键词歧义）。
++
++    计分规则（按优先级）：
++    1. 显式提及：query 中出现 skill 全名 → 按名字长度降序，最先命中的直接胜出
++       （"用 literature_reviewer" 必须命中 literature_reviewer，而不是 reviewer）
++    2. 强意图短语：命中 _HARD_INTENTS 的唯一语义短语（如"去AI味"→ ccf-humanization）
++       → 直接返回对应 skill（前提已注册），不再参与打分
++    3. 关键词命中：
++       - 中文关键词完整命中 +1（不做模糊的"动词首字"匹配，避免"写一个"靠"写"字误命中）
++       - 英文单词 +1（自动匹配单复数变体）；英文多词短语（含空格，如 "code review"）+3
++       - 英文元词（ccfa/ccf/skill/skills/codex，_LOW_DISC_EN）命中不计分——
++         "用ccfa skills里相应的skill" 是名词性泛指，不是任何具体动作信号
++    4. 描述领域词：description 英文单词与 query 英文单词做集合交集（剔除元词），每个 +1；
++       中文短语直接子串命中 +2；部分重叠（公共中文 bigram）+1 each（skill 级封顶 +3，
++       避免触发词多的 skill 因通用词"论文/检查"系统性占优）
++    5. 描述动作动词首字命中（弱信号，封顶 +2）：描述中文短语以动词字开头且该动词字
++       出现在 query 中，说明 query 的动作与该 skill 相关。按"动作纯度"加权：
++       短语中文部分 ≤3 字（纯动作/动宾短语，如"写作""写代码"）权重 1.0；
++       更长短语（动词嵌在复合概念里，如"写作评审""审稿意见回复"）权重 0.5——
++       否则"写…论文初稿"时 paper-reviewer 会靠描述里的"写作评审"与 paper-writer
++       的"写作"打平，再因名字更长而误胜出。
++
++    家族信号：query 含 "ccf"（如 "ccfa skills"、"CCF-A级别"）说明用户明确要在
++    CCFA 技能家族内选择 → 内置 skill 不参与，家族成员各 +1 基础分，阈值升到 2
++    （基础分 1 + 至少一个实质信号，避免"ccf 是什么"这类无动作 query 瞎选）。
++
++    总分最高者胜出；同分时内置 skill 优先于 CCFA 家族（内置是默认能力，
++    家族 skill 需要明确信号才能抢），再同分取名字更长者，再同分取注册顺序靠前的 skill。
++    低于最低阈值（默认 1.0，家族信号下 2.0）返回 None，走默认流程——
++    宁可不路由，也不要错误路由（"不匹配任何一个 skill 就别用"）。
++    """
++    q = query.lower()
++    q_en, q_cn = _split_terms(q)
++    q_cn_grams = set().union(*[_cn_2grams(p) for p in q_cn]) if q_cn else set()
++
++    # 1) 显式提及：名字最长者优先（literature_reviewer > reviewer）
++    named = sorted(_SKILLS.keys(), key=len, reverse=True)
++    for name in named:
++        if name.lower() in q:
++            return _SKILLS[name]
++
++    # 2) 强意图短语：唯一语义，命中即返回
++    for pattern, skill_name in _HARD_INTENTS:
++        if pattern.search(q) and skill_name in _SKILLS:
++            return _SKILLS[skill_name]
++
++    # 家族信号：query 提到 ccf（ccfa skills / CCF-A 级别 / ccf 技能...）
++    family = "ccf" in q
++    min_score = 2.0 if family else 1.0
++
++    # 3/4/5) 打分制
++    best_skill: Optional[Skill] = None
++    best_score = 0.0
++    for skill in _SKILLS.values():
++        # 家族信号下只考虑 CCFA 家族成员（内置 skill 不参与，避免 coder 靠"写一个"抢走）
++        if family and not skill.name.startswith("ccf-"):
++            continue
++        # 家族基础分：用户明确提到 CCFA，家族成员至少 +1
++        score = 1.0 if family else 0.0
++        # 关键词命中
++        for kw in skill.keywords:
++            if not kw:
++                continue
++            if re.search(r"[\u4e00-\u9fff]", kw):
++                # 中文关键词：必须完整命中（不做模糊的动词首字匹配）
++                if kw in q:
++                    score += 1
++            elif " " in kw.strip():
++                # 英文多词短语（如 "code review"）是强信号，权重更高
++                if re.search(rf"(?<![a-zA-Z]){re.escape(kw.strip())}(?![a-zA-Z])", q):
++                    score += 3
++            else:
++                # 单英文词：匹配原词及其单复数变体（元词不计分）
++                if kw.lower() not in _LOW_DISC_EN and any(
++                    re.search(rf"(?<![a-zA-Z]){re.escape(c)}(?![a-zA-Z])", q)
++                    for c in _kw_candidates(kw) if c not in _LOW_DISC_EN
++                ):
++                    score += 1
++        # 描述领域词：英文单词交集（剔除元词与停用词）
++        desc = skill.description or ""
++        d_en, d_cn = _split_terms(desc)
++        score += len(q_en & d_en - _LOW_DISC_EN - _EN_STOPWORDS)
++        # 描述中文短语：直接子串 +2；部分重叠（公共 2-gram）+1 each（去重后封顶 +3，
++        # 避免触发词多的 skill 因通用词"论文/检查"重复计分而系统性占优）
++        all_phrase_grams = set().union(*[_cn_2grams(p) for p in d_cn if p]) if d_cn else set()
++        direct_hit = 0
++        for phrase in d_cn:
++            if not phrase:
++                continue
++            if phrase in q:
++                direct_hit += 1
++        score += min(3, direct_hit) * 2 + min(3, len(all_phrase_grams & q_cn_grams))
++        # 描述动作动词首字命中：描述中的中文短语若以动词字开头（如"写作"→"写"，
++        # "监控"→"监"），且该动词字出现在 query 中，说明 query 的动作与该 skill 相关。
++        # 这是区分"写论文→paper-writer"和"追踪论文→literature-monitor"的关键信号。
++        # 弱信号，按"动作纯度"加权（封顶 +2）：
++        # - 短语中文部分 ≤3 字（纯动作/动宾短语，如"写作""写代码"）→ 权重 1.0
++        # - 更长短语（动词嵌在复合概念里，如"写作评审""审稿意见回复"）→ 权重 0.5
++        #   否则"写…论文初稿"时 paper-reviewer 会靠描述里的"写作评审"与
++        #   paper-writer 的"写作"打平，再因名字更长而误胜出。
++        verb_score = 0.0
++        for phrase in d_cn:
++            if not phrase:
++                continue
++            first_char = phrase[0]
++            if first_char in _CN_VERB_CHARS and first_char in q:
++                cn_len = len(re.findall(r"[\u4e00-\u9fff]", phrase))
++                verb_score += 1.0 if cn_len <= 3 else 0.5
++        score += min(2.0, verb_score)
++
++        # 胜出/平局处理：分数更高胜出；同分时内置 skill 优先于 CCFA 家族，
++        # 同类再比名字长度（更具体的 skill 胜出）
++        if score > best_score:
++            best_score, best_skill = score, skill
++        elif score > 0 and score == best_score and best_skill is not None:
++            b_family = best_skill.name.startswith("ccf-")
++            s_family = skill.name.startswith("ccf-")
++            if b_family and not s_family:
++                # 内置 skill 优先于 CCFA 家族（如 researcher vs ccf-literature-searcher）
++                best_skill = skill
++            elif b_family == s_family and len(skill.name) > len(best_skill.name):
++                best_skill = skill
++
++    return best_skill if best_score >= min_score else None
++
++
+ def get_skill(name: str) -> Optional[Skill]:
+     """Look up a registered skill by name."""
+     return _SKILLS.get(name)
+@@ -79,11 +286,14 @@ register_skill(Skill(
+     prompt=(
+         "You are an expert software engineer. Write clean, well-tested code. "
+         "Use tools to read existing code before making changes. "
+-        "Always verify your changes compile/run correctly."
++        "Always verify your changes compile/run correctly.\n\n"
++        "重要规则：在调用 write 或 edit 工具创建/修改文件之前，必须先征求用户同意（如\"我将写入 {path}，可以吗？\"）。"
++        "只有用户同意后才执行写入。如果用户没有明确要求写入文件，直接在回复中输出内容即可。"
+     ),
+     tools=["read", "write", "edit", "bash", "grep", "glob"],
+     temperature=0.3,
+-    description="Software engineering focused agent",
++    description="软件工程/编程/Software Engineering：写代码、修 bug、实现功能、跑测试，write code, implement features, fix bugs",
++    keywords=["写代码", "编码", "实现", "修复bug", "debug", "开发", "编程", "写一个", "写个", "program", "implement", "code"],
+ ))
+ 
+ register_skill(Skill(
+@@ -92,9 +302,11 @@ register_skill(Skill(
+         "You are a research assistant. Gather information thoroughly, "
+         "verify facts from multiple sources, and present findings clearly."
+     ),
+-    tools=["bash", "read", "grep", "glob"],
++    tools=["bash", "read", "grep", "glob", "web_search", "tavily_search", "tavily_extract"],
+     temperature=0.5,
+-    description="Information gathering and analysis",
++    description="资料调研/信息收集：查询事实、搜集资料、多源验证",
++    keywords=["调研", "查一下", "搜索", "搜索一下", "资料", "信息", "查资料", "research", "search", "搜集",
++              "web", "上网查", "上网搜", "搜一下", "找资料", "了解一下"],
+ ))
+ 
+ register_skill(Skill(
+@@ -105,7 +317,8 @@ register_skill(Skill(
+     ),
+     tools=["read", "grep", "glob"],
+     temperature=0.3,
+-    description="Code review specialist",
++    description="代码审查/Code Review：审阅代码质量、找 bug、安全/性能问题，review code quality, find bugs, security issues",
++    keywords=["review", "审查", "代码评审", "审阅", "code review", "检查代码", "review my code"],
+ ))
+ 
+ register_skill(Skill(
+@@ -116,46 +329,30 @@ register_skill(Skill(
+     ),
+     tools=["read", "write", "edit", "bash", "grep", "glob"],
+     temperature=0.3,
+-    description="Testing and quality assurance",
++    description="测试/质量保障：编写并运行单元测试、覆盖边界情况",
++    keywords=["测试", "写测试", "单元测试", "test", "testing", "pytest", "unittest"],
+ ))
+ 
+-
+-# 在 miniagent/skills.py 文件末尾新增
+-
+ register_skill(Skill(
+     name="literature_reviewer",
+     prompt=(
+-        "你是一位学术综述专家。核心任务：针对用户给定的任意研究主题，独立完成一篇高质量、有深度的文献综述（目标篇幅：2000-4000字，可根据用户要求灵活调整）。\n\n"
+-        "执行时必须严格遵循以下**六步闭环方法论**：\n\n"
+-        
+-        "### 第一步：动态检索式设计（多维度并行）\n"
+-        "针对用户提出的研究主题，设计以下三类搜索串并同时发起（根据用户主题动态替换核心变量，严禁照搬示例）：\n"
+-        "  (a) 核心变量检索：『核心自变量 + 因变量 + 实证/检验』\n"
+-        "  (b) 机制路径检索：『核心自变量 + 常见中介变量 + 中介效应』\n"
+-        "  (c) 顶刊定向检索：『核心自变量 + 顶刊名称』\n\n"
+-        
+-        "### 第二步：文献初筛与分类\n"
+-        "阅读搜索结果中的标题和摘要，将文献分为两类分别处理：\n"
+-        "  - 实证类文献：提取五要素（作者年份 | 样本区间 | 核心结论 | 中介/调节变量 | 异质性发现），缺项则标记为'信息不全'并降级使用，不直接弃用。\n"
+-        "  - 理论类/综述类文献：提取核心构念定义和理论框架/演进脉络，不受五要素限制，优先保留。\n\n"
+-        
+-        "### 第三步：滚雪球扩展（后向追溯）\n"
+-        "从初筛得到的高质量文献中，提取其参考文献列表中的经典著作或标志性论文，进行第二轮补充检索，确保不遗漏领域基石。\n\n"
+-        
+-        "### 第四步：构建文献对比矩阵（内部记忆，不落盘）\n"
+-        "在思维中整理结构化对比表格（列：作者年份、样本、结论、中介、异质性、类型）。此矩阵仅保存在对话上下文中，严禁调用 write_file 写入磁盘。若用户要求核对文献质量，可在回复中直接打印 Markdown 表格供其审阅，但不生成实体文件。\n\n"
+-        
+-        "### 第五步：三段式深度叙事\n"
+-        "基于对比矩阵，按以下三段式结构撰写综述正文（严禁平铺直叙罗列摘要）：\n"
+-        "  - 共识：哪些结论被多篇高质量文献共同证实？形成共识的样本/方法基础是什么？\n"
+-        "  - 分歧：哪些结论存在显著冲突？分歧的深层根源是什么（样本区间、模型设定、变量度量、制度背景变化等）？\n"
+-        "  - 展望：现有研究的空白/局限是什么？未来可能突破的方向或待引入的新视角/新方法是什么？\n"
+-        "呈现约束：上述三段式仅作为内在逻辑结构，严禁在最终正文中使用'共识区''分歧区''展望区'作为小标题或显式字段。必须通过自然段落过渡体现逻辑推进，让结构隐形于论述之中。\n\n"
+-        
+-        "### 第六步：反幻觉自检与终稿输出\n"
+-        "输出终稿前，逐条核对参考文献：确保每个(作者,年份)都能在对比矩阵或搜索结果中找到对应记录。无来源者立即删除。自检完成后，直接在聊天框中输出综述全文。仅当用户明确要求保存（如'存下来''保存到本地'）时，才调用 write_file 写入单个 .md 文件，并告知存储路径。"
++        "你是一位学术综述专家。针对用户给定的主题撰写高质量文献综述。\n\n"
++        "**篇幅铁律**：用户明确指定字数（如『800字』）时，全文必须严格控制在要求字数左右（±15%），"
++        "宁短勿长，禁止写成远超要求的小作文；用户未指定时默认 800–1200 字。\n\n"
++        "执行流程（严格按顺序）：\n"
++        "1. **多轮检索**：先用 tavily_search 做至少 2-3 次不同角度的检索（如『主题+综述/评估框架』、『主题+open source/工程实践』、『主题+研究进展』），每次检索后阅读标题/摘要筛选相关文献。\n"
++        "2. **结构规划**：在写作前先规划综述结构（概念界定→共识→分歧→展望），随后按结构展开写作。\n"
++        "3. **写作要求**：\n"
++        "   - 每篇引用必须来自检索结果，禁止编造不存在的论文/数据/引文；检索不到的细节明确标注『未检索到』。\n"
++        "   - 结构上避免机械列点，用自然段落推进：先界定概念，再总结共识，接着呈现分歧并分析根源，最后展望未来方向。\n"
++        "   - 语言专业、有深度，避免空话套话。\n"
++        "   - 若用户限定了字数，段落要精炼：每个要点一句话讲透，不重复、不铺陈。\n"
++        "4. **反幻觉自检**：终稿前逐条核对引用是否能在检索结果中找到来源，找不到的立即删除。\n"
++        "5. 直接输出综述全文。仅当用户明确要求保存时才调用 write 写入 .md 文件。"
+     ),
+-    tools=[ "tavily_search", "tavily_extract", "read", "write", "edit", "bash", "grep", "glob"],
+-    temperature=0.25,
+-    max_iterations=20,
++    tools=["tavily_search", "tavily_extract", "read", "write", "edit", "bash", "grep", "glob"],
++    temperature=0.4,
++    max_iterations=25,
++    description="文献综述/学术综述：围绕主题检索文献并撰写有深度的综述文章",
++    keywords=["综述", "文献综述", "review the literature", "literature review", "survey", "研究现状", "进展", "overview", "评述"],
+ ))
+diff --git a/miniagent/utils/json_utils.py b/miniagent/utils/json_utils.py
+index 955357a..924ecc5 100644
+--- a/miniagent/utils/json_utils.py
++++ b/miniagent/utils/json_utils.py
+@@ -81,6 +81,14 @@ def parse_json(json_str: str) -> Union[Dict, List]:
+             return json.loads(json_str, strict=False)
+         except json.JSONDecodeError:
+             pass
++
++        # Try to fix invalid backslash escapes (e.g. Windows paths like D:\Internet\Temp
++        # where \I and \T are not valid JSON escapes) — common in LLM output.
++        try:
++            fixed = _fix_invalid_escapes(json_str)
++            return json.loads(fixed)
++        except (json.JSONDecodeError, ValueError):
++            pass
+         
+         # Try to fix unescaped newlines in string values
+         # This is common when LLM generates multi-line code
+@@ -125,6 +133,39 @@ def parse_json(json_str: str) -> Union[Dict, List]:
+             return {}
+ 
+ 
++def _fix_invalid_escapes(json_str: str) -> str:
++    """
++    Fix invalid backslash escapes in a JSON string.
++
++    LLMs frequently emit Windows paths (e.g. ``D:\\Internet\\Temp``) with a single
++    backslash: ``"path": "D:\\Internet\\Temp\\out.md"``. In strict JSON, ``\\I`` and
++    ``\\T`` are invalid escapes and ``json.loads`` rejects the whole document.
++
++    Valid escapes are kept as-is: ``\\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX``.
++    Any other ``\\x`` is rewritten so the backslash becomes a literal ``\\``
++    (JSON-escaped), preserving the intended character.
++    """
++    result = []
++    i = 0
++    n = len(json_str)
++    valid = ('"', "\\", "/", "b", "f", "n", "r", "t", "u")
++    while i < n:
++        ch = json_str[i]
++        if ch == "\\" and i + 1 < n and json_str[i + 1] in valid:
++            result.append(ch)
++            result.append(json_str[i + 1])
++            i += 2
++            continue
++        if ch == "\\" and i + 1 < n:
++            # Invalid escape: keep the backslash as a literal (escaped in JSON)
++            result.append("\\\\")
++            i += 1
++            continue
++        result.append(ch)
++        i += 1
++    return "".join(result)
++
++
+ def _fix_unescaped_newlines(json_str: str) -> str:
+     """
+     Fix unescaped newlines inside JSON string values.

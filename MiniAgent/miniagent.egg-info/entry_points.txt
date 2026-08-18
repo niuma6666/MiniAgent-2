@@ -1,0 +1,2 @@
+[console_scripts]
+miniagent = miniagent.cli:main

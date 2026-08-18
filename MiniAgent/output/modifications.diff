@@ -1,0 +1,542 @@
+diff --git a/miniagent/agent.py b/miniagent/agent.py
+index 047b220..57e03f0 100644
+--- a/miniagent/agent.py
++++ b/miniagent/agent.py
+@@ -57,11 +57,6 @@ You are a helpful, empathetic assistant with access to tools. Follow these rules
+ 
+ Available tools: {tools_prompt}
+ 
+-0.**Skill Selection** (On-Demand):
+-   - Check if the user's request matches any registered skill (e.g., literature review -> `literature_reviewer`, coding -> `coder`).
+-   - If matched: Call `use_skill` FIRST, then follow its instructions.
+-   - If unmatched: Skip. Answer directly or use general tools (search, read/write).
+-
+ 1. **Tool format** (required):
+    TOOL: <tool_name>
+    ARGS: {{"parameter_name": "parameter_value"}}
+@@ -96,6 +91,33 @@ Available tools: {tools_prompt}
+    - Respond naturally, politely, and helpfully.
+ 
+ 
++Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess."""
++
++    # Native FC 模式专用模板：不需要文本 TOOL: 格式，改用 tool_schemas 调用
++    _NATIVE_MODE_PROMPT = """\
++{base_prompt}
++
++You are a helpful, empathetic assistant with access to tools. Follow these rules:
++
++You have the following tools available (use them via the tool-calling interface, never print TOOL:/ARGS: text): {tools_prompt}
++
++1. **Tool usage**:
++   - When you need information or need to perform an action, call the appropriate tool with correct arguments.
++   - Wait for the tool result, then continue.
++
++2. **When to search**:
++   - For factual, recent, or verifiable info (news, data, citations), ALWAYS use tavily_search or web_search first.
++   - Use internal knowledge only for common sense, or if search returns nothing.
++
++3. **Response & Termination**:
++   - After executing a tool, explain the result clearly.
++   - **When you believe you have fully answered the user's question (whether or not you used a tool), you MUST start your final response with `FINAL_ANSWER:`**.
++   - After using `FINAL_ANSWER:`, do NOT call any more tools. This is the only way to end the task.
++
++4. **Final Output Format**:
++   - Use Simplified Chinese as the primary language. Proper nouns, technical terms, acronyms, and file/API names may remain in English.
++   - Use markdown for readability when helpful.
++
+ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess."""
+ 
+ 
+@@ -111,6 +133,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         use_reflector: bool = False,
+         confirm_dangerous: bool = False,
+         confirm_callback: Optional[Callable[[str], bool]] = None,
++        auto_route_skills: bool = True,
+         **kwargs
+     ):
+         """
+@@ -125,6 +148,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             use_reflector: Whether to use the Reflector to improve reasoning
+             confirm_dangerous: If True, dangerous bash commands require confirmation
+             confirm_callback: Function(cmd) -> bool for confirmation. Defaults to stdin prompt.
++            auto_route_skills: If True, automatically load a matching skill from the user's
++                query before the agent loop starts (no longer relies on the LLM deciding
++                on its own to call use_skill).
+             **kwargs: Additional parameters for the OpenAI client
+         """
+         self.model = model
+@@ -133,6 +159,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         self.temperature = temperature
+         self._base_temperature = temperature  # 保存初始基准温度，用于重置
+         self.system_prompt = system_prompt
++        self.auto_route_skills = auto_route_skills
+ 
+         
+ 
+@@ -156,6 +183,10 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         self.confirm_callback = confirm_callback
+         self._skill_tool_whitelist = None   # 存储技能允许的工具名称列表，None表示不过滤
+         
++        # 工具描述 prompt 缓存（_build_tools_prompt 的结果，按工具集变化失效）
++        self._tools_prompt_cache: Optional[str] = None
++        self._tools_prompt_cache_key: Optional[tuple] = None
++        
+         # Cache config limits (read env vars once, not per-request)
+         self._max_context_messages = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
+         self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "800000"))     #16000改到800000，同步改.env文件
+@@ -226,6 +257,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+                 raise ValueError(f"Tool is missing a required field: {key}")
+                 
+         self.tools.append(tool)
++        # 工具集变化，使工具描述缓存失效
++        self._tools_prompt_cache = None
++        self._tools_prompt_cache_key = None
+         logger.debug(f"Added tool: {tool['name']}")
+     
+     def load_builtin_tool(self, tool_name: str) -> bool:
+@@ -283,6 +317,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         self._skill_tool_whitelist = None
+         # 恢复用户最初设定的温度，避免被上次技能修改
+         self.temperature = self._base_temperature
++        # 技能变化，工具描述缓存失效
++        self._tools_prompt_cache = None
++        self._tools_prompt_cache_key = None
+         logger.debug("Skill state has been reset.")
+ 
+     
+@@ -302,7 +339,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+         skill = get_skill(skill_name)
+         if not skill:
+-            self._reset_skill_state()
++            # 修复：加载失败不应清空已加载的 skill 状态（原代码调用 _reset_skill_state 会误清）
+             console.print(f"[dim]❌ Skill load FAILED: '{skill_name}' (not found)[/dim]")
+             return f"错误：未找到技能 '{skill_name}'。可用技能：{list(_SKILLS.keys())}"
+     
+@@ -332,13 +369,21 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         """
+         构建工具描述字符串，供 system prompt 使用。
+         如果当前加载了技能且技能指定了工具白名单，则只显示白名单中的工具。
++
++        使用缓存：同一技能/同一工具集下只构建一次，避免每轮迭代重复拼接。
+         """
+         # 获取当前应该展示的工具列表（根据技能白名单过滤）
+         tools_to_show = self._get_filtered_tools()
+ 
++        # 缓存键：白名单工具名序列（同一技能下工具不变，无需重复构建）
++        cache_key = tuple(t["name"] for t in tools_to_show)
++        if self._tools_prompt_cache_key == cache_key and self._tools_prompt_cache is not None:
++            return self._tools_prompt_cache
++
+         # 如果最终列表为空，直接返回提示信息（避免空描述）
+         if not tools_to_show:
+-            return "(没有可用工具)"
++            self._tools_prompt_cache, self._tools_prompt_cache_key = "(没有可用工具)", cache_key
++            return self._tools_prompt_cache
+ 
+         tools_desc = []
+         for tool in tools_to_show:
+@@ -360,7 +405,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             )
+             tools_desc.append(desc)
+     
+-        return "\n".join(tools_desc)
++        result = "\n".join(tools_desc)
++        self._tools_prompt_cache, self._tools_prompt_cache_key = result, cache_key
++        return result
+     
+ 
+ 
+@@ -869,16 +916,20 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+     
+ 
+-    def _build_dynamic_system_prompt(self) -> str:
+-        """根据当前加载的技能动态构建系统提示词"""
++    def _build_dynamic_system_prompt(self, mode: str = "text") -> str:
++        """根据当前加载的技能动态构建系统提示词
+ 
++        Args:
++            mode: "text" 或 "native"，决定使用哪个模板
++        """
+         base = self._loaded_skill.prompt if self._loaded_skill else self.system_prompt
+         if self._loaded_skill:
+             console.print(f"[dim]📄 Using SKILL PROMPT: {self._loaded_skill.name}[/dim]")
+         else:
+             console.print(f"[dim]📄 Using DEFAULT SYSTEM PROMPT (no skill loaded)[/dim]")
+ 
+-        return self._TEXT_MODE_PROMPT.format(
++        template = self._NATIVE_MODE_PROMPT if mode == "native" else self._TEXT_MODE_PROMPT
++        return template.format(
+             base_prompt=base,
+             tools_prompt=self._build_tools_prompt(),
+         )
+@@ -892,6 +943,9 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         初始化每次运行的公共环境：重置技能状态、初始化消息列表、获取限制参数
+         """
+         self._reset_skill_state()
++        # ===== 自动路由：根据用户提问自动加载匹配的 skill =====
++        if self.auto_route_skills:
++            self._auto_route_skill(query)
+         logger.info(f"Starting query: {query[:50]}...")
+         messages = [
+             {"role": "system", "content": ""},  # 占位，每轮动态更新
+@@ -899,6 +953,30 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         ]
+         return messages, self._max_context_messages, self._tool_result_limit
+ 
++    def _auto_route_skill(self, query: str):
++        """
++        根据用户提问自动加载最匹配的 skill（无需用户显式提及，也无需 LLM 自觉调用 use_skill）。
++
++        路由策略：
++        1. 关键词命中（skill.keywords / description 包含 query 中的词）
++        2. 显式提及（query 里直接写了 skill 名字，如 "用 literature_reviewer"）
++
++        返回加载的 Skill 或 None。
++        """
++        from .skills import match_skill
++
++        skill = match_skill(query)
++        if skill is None:
++            return None
++
++        self._loaded_skill = skill
++        self._skill_tool_whitelist = skill.tools
++        if skill.temperature is not None:
++            self.temperature = skill.temperature
++        console.print(f"[dim]🎯 AUTO-ROUTED to skill: '{skill.name}' (from query)[/dim]")
++        logger.info(f"Auto-routed to skill: {skill.name}")
++        return skill
++
+ 
+ 
+     def _force_final_answer(self, messages: List[Dict], max_iterations: int) -> str:
+@@ -942,7 +1020,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             messages = self._compress_if_needed(messages, max_ctx)
+ 
+             # ===== 动态更新 system prompt =====
+-            system_content = self._build_dynamic_system_prompt()
++            system_content = self._build_dynamic_system_prompt(mode="text")
+             messages[0] = {"role": "system", "content": system_content}
+ 
+             if status_callback:
+@@ -1004,16 +1082,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+ 
+             messages.append({"role": "user", "content": feedback})
+ 
+-        # 超出迭代次数，强制生成最终答案
+-        logger.warning(f"Reached maximum iterations ({max_iterations})")
+-        messages.append({
+-            "role": "user",
+-            "content": "你已尝试多次工具调用，请根据所有已知信息，用中文给出最终答案，并以 FINAL_ANSWER: 开头。"
+-        })
+-        final = self._call_llm(messages)
+-        if final.strip().startswith("FINAL_ANSWER:"):
+-            return final[len("FINAL_ANSWER:"):].strip()
+-        return final
++        # 超出迭代次数，强制生成最终答案（复用 _force_final_answer，避免重复逻辑）
++        return self._force_final_answer(messages, max_iterations)
+ 
+ 
+ 
+@@ -1035,8 +1105,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+         for iteration in range(max_iterations):
+             messages = self._compress_if_needed(messages, max_ctx)
+ 
+-            # 动态更新 system
+-            system_content = self._build_dynamic_system_prompt()
++            # 动态更新 system（native 模式使用独立模板，不再要求文本 TOOL: 格式）
++            system_content = self._build_dynamic_system_prompt(mode="native")
+             messages[0] = {"role": "system", "content": system_content}
+ 
+             if status_callback:
+@@ -1070,9 +1140,19 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
+             if msg.content and msg.content.strip().startswith("FINAL_ANSWER:"):
+                 return msg.content[len("FINAL_ANSWER:"):].strip()
+ 
+-            # 无工具调用，直接返回内容（可能已经回答）
++            # 无工具调用：与 text 模式保持一致，判断响应是否完整
+             if not msg.tool_calls:
+-                return msg.content or ""
++                content = (msg.content or "").strip()
++                # 响应足够长且无"未完成"暗示 → 视为完成
++                if len(content) > 100 and not any(kw in content for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]):
++                    return content
++                # 否则引导 LLM 继续（把本轮回复加入历史，避免原地打转）
++                messages.append(msg)
++                messages.append({
++                    "role": "user",
++                    "content": "当前回复没有工具调用且不完整。请调用工具获取信息，或如果已足够，请以 FINAL_ANSWER: 开头给出最终回答。"
++                })
++                continue
+ 
+             messages.append(msg)
+ 
+diff --git a/miniagent/cli.py b/miniagent/cli.py
+index 43efc7b..684b78d 100644
+--- a/miniagent/cli.py
++++ b/miniagent/cli.py
+@@ -203,6 +203,15 @@ def _build_agent(args: argparse.Namespace) -> tuple[MiniAgent, Memory]:
+     for tool_name in tools:
+         agent.load_builtin_tool(tool_name)
+ 
++    # ===== 加载 CCFA-Skills 技能家族（可选，设置 CCFA_SKILLS_ROOT 环境变量启用）=====
++    import os as _os
++    if _os.environ.get("CCFA_SKILLS_ROOT"):
++        try:
++            from .ccfa_loader import load_ccfa_skills
++            load_ccfa_skills()
++        except Exception as e:
++            console.print(f"[dim]⚠️ CCFA skills 加载失败: {e}[/dim]")
++
+     return agent, memory
+ 
+ 
+diff --git a/miniagent/skills.py b/miniagent/skills.py
+index 6388b8e..d04ff6d 100644
+--- a/miniagent/skills.py
++++ b/miniagent/skills.py
+@@ -26,6 +26,7 @@ Example usage:
+ 
+ from __future__ import annotations
+ 
++import re
+ from dataclasses import dataclass, field
+ from typing import Dict, List, Optional
+ 
+@@ -42,6 +43,8 @@ class Skill:
+     temperature: Optional[float] = None
+     max_iterations: Optional[int] = None
+     description: str = ""
++    # 路由关键词：命中用户提问即自动加载该 skill（解决"不能自主选择 skill"问题）
++    keywords: List[str] = field(default_factory=list)
+ 
+ 
+ def register_skill(skill: Skill) -> Skill:
+@@ -60,6 +63,127 @@ def register_skill(skill: Skill) -> Skill:
+     return skill
+ 
+ 
++def _split_terms(text: str) -> tuple[set, set]:
++    """把文本拆成英文单词集合 + 中文短语集合（用于匹配打分）。
++
++    注意：不能依赖 re 的 \\b——中文也属于 \\w，\\b 在中英边界不生效。
++    """
++    en = set(re.findall(r"[a-zA-Z][a-zA-Z-]{1,30}", text.lower()))
++    cn = set()
++    for part in re.split(r"[，,；;。：:\s]+", text):
++        part = part.strip()
++        if part and re.search(r"[\u4e00-\u9fff]", part):
++            cn.add(part)
++    return en, cn
++
++
++def _cn_2grams(text: str) -> set:
++    """提取文本中所有连续的两个汉字（中文 bigram）。"""
++    grams = set()
++    for i in range(len(text) - 1):
++        g = text[i:i + 2]
++        if re.fullmatch(r"[\u4e00-\u9fff]{2}", g):
++            grams.add(g)
++    return grams
++
++
++def _kw_candidates(kw: str) -> set:
++    """英文单词关键词的匹配候选：原词 + 常见单复数变体。
++
++    例：kw="rebuttals" 时 query 里出现 "rebuttal" 也能命中。
++    """
++    c = {kw}
++    if kw.endswith("s"):
++        c.add(kw[:-1])
++    else:
++        c.add(kw + "s")
++        c.add(kw + "es")
++    return c
++
++
++# 常见中文动作字（用于"动词首字命中"：query 含触发词的动作字 → 弱信号）
++_CN_VERB_CHARS = set(
++    "写改润审查搜优监回检提压缩绘设规拆打比转核找调评校验测试编跑修删增补读看"
++    "研究探索跟追复投汇总列排分析整理清除扫描备份恢复导出录询部署发布构建译选筛"
++)
++
++
++def match_skill(query: str) -> Optional[Skill]:
++    """根据用户提问自动匹配最合适的 skill（打分制，消除短名/关键词歧义）。
++
++    计分规则（按优先级）：
++    1. 显式提及：query 中出现 skill 全名 → 按名字长度降序，最先命中的直接胜出
++       （"用 literature_reviewer" 必须命中 literature_reviewer，而不是 reviewer）
++    2. 关键词命中：
++       - 中文关键词完整命中 +1；query 含其首部动作字（如"写作"命中"写"）+1
++       - 英文单词 +1（自动匹配单复数变体）；英文多词短语（含空格，如 "code review"）+3
++    3. 描述领域词：description 英文单词与 query 英文单词做集合交集，每个 +1；
++       中文短语直接子串命中 +2；部分重叠（公共中文 bigram）+1 each（skill 级封顶 +3，
++       避免触发词多的 skill 因通用词"论文/检查"系统性占优）
++
++    总分最高者胜出；同分时名字更长者优先（专业 skill 名字通常更具体），
++    再同分则取注册顺序靠前的 skill。
++    返回 None 表示无匹配，走默认流程。
++    """
++    q = query.lower()
++    q_en, q_cn = _split_terms(q)
++    q_cn_grams = set().union(*[_cn_2grams(p) for p in q_cn]) if q_cn else set()
++
++    # 1) 显式提及：名字最长者优先（literature_reviewer > reviewer）
++    named = sorted(_SKILLS.keys(), key=len, reverse=True)
++    for name in named:
++        if name.lower() in q:
++            return _SKILLS[name]
++
++    # 2/3) 打分制
++    best_skill: Optional[Skill] = None
++    best_score = 0
++    for skill in _SKILLS.values():
++        score = 0
++        # 关键词命中（英文关键词需要前后非字母数字边界，防止子串误匹配）
++        for kw in skill.keywords:
++            if not kw:
++                continue
++            if re.search(r"[\u4e00-\u9fff]", kw):
++                # 中文关键词：完整命中 +1；query 含其首部动作字（弱信号）+1
++                if kw in q:
++                    score += 1
++                elif any(ch in _CN_VERB_CHARS for ch in kw[:2]) and any(ch in q for ch in kw[:2] if ch in _CN_VERB_CHARS):
++                    score += 1
++            elif " " in kw.strip():
++                # 英文多词短语（如 "code review"）是强信号，权重更高
++                if re.search(rf"(?<![a-zA-Z]){re.escape(kw.strip())}(?![a-zA-Z])", q):
++                    score += 3
++            else:
++                # 单英文词：匹配原词及其单复数变体
++                if any(re.search(rf"(?<![a-zA-Z]){re.escape(c)}(?![a-zA-Z])", q) for c in _kw_candidates(kw)):
++                    score += 1
++        # 描述领域词：英文单词交集
++        desc = skill.description or ""
++        d_en, d_cn = _split_terms(desc)
++        score += len(q_en & d_en)
++        # 描述中文短语：直接子串 +2；部分重叠（公共 2-gram）+1 each（去重后封顶 +3，
++        # 避免触发词多的 skill 因通用词"论文/检查"重复计分而系统性占优）
++        all_phrase_grams = set().union(*[_cn_2grams(p) for p in d_cn if p]) if d_cn else set()
++        direct_hit = 0
++        grams_hit = 0
++        for phrase in d_cn:
++            if not phrase:
++                continue
++            if phrase in q:
++                direct_hit += 1
++        score += min(3, direct_hit) * 2 + min(3, len(all_phrase_grams & q_cn_grams))
++
++        # 同分时名字更长者优先（更具体的 skill 胜出）
++        if score > best_score or (
++            score > 0 and score == best_score
++            and best_skill is not None and len(skill.name) > len(best_skill.name)
++        ):
++            best_score, best_skill = score, skill
++
++    return best_skill if best_score > 0 else None
++
++
+ def get_skill(name: str) -> Optional[Skill]:
+     """Look up a registered skill by name."""
+     return _SKILLS.get(name)
+@@ -83,7 +207,8 @@ register_skill(Skill(
+     ),
+     tools=["read", "write", "edit", "bash", "grep", "glob"],
+     temperature=0.3,
+-    description="Software engineering focused agent",
++    description="软件工程/编程/Software Engineering：写代码、修 bug、实现功能、跑测试，write code, implement features, fix bugs",
++    keywords=["写代码", "编码", "实现", "修复bug", "debug", "开发", "编程", "写一个", "写个", "program", "implement", "code"],
+ ))
+ 
+ register_skill(Skill(
+@@ -92,9 +217,10 @@ register_skill(Skill(
+         "You are a research assistant. Gather information thoroughly, "
+         "verify facts from multiple sources, and present findings clearly."
+     ),
+-    tools=["bash", "read", "grep", "glob"],
++    tools=["bash", "read", "grep", "glob", "web_search", "tavily_search", "tavily_extract"],
+     temperature=0.5,
+-    description="Information gathering and analysis",
++    description="资料调研/信息收集：查询事实、搜集资料、多源验证",
++    keywords=["调研", "查一下", "搜索", "搜索一下", "资料", "信息", "查资料", "research", "search", "搜集"],
+ ))
+ 
+ register_skill(Skill(
+@@ -105,7 +231,8 @@ register_skill(Skill(
+     ),
+     tools=["read", "grep", "glob"],
+     temperature=0.3,
+-    description="Code review specialist",
++    description="代码审查/Code Review：审阅代码质量、找 bug、安全/性能问题，review code quality, find bugs, security issues",
++    keywords=["review", "审查", "代码评审", "审阅", "code review", "检查代码", "review my code"],
+ ))
+ 
+ register_skill(Skill(
+@@ -116,46 +243,27 @@ register_skill(Skill(
+     ),
+     tools=["read", "write", "edit", "bash", "grep", "glob"],
+     temperature=0.3,
+-    description="Testing and quality assurance",
++    description="测试/质量保障：编写并运行单元测试、覆盖边界情况",
++    keywords=["测试", "写测试", "单元测试", "test", "testing", "pytest", "unittest"],
+ ))
+ 
+-
+-# 在 miniagent/skills.py 文件末尾新增
+-
+ register_skill(Skill(
+     name="literature_reviewer",
+     prompt=(
+-        "你是一位学术综述专家。核心任务：针对用户给定的任意研究主题，独立完成一篇高质量、有深度的文献综述（目标篇幅：2000-4000字，可根据用户要求灵活调整）。\n\n"
+-        "执行时必须严格遵循以下**六步闭环方法论**：\n\n"
+-        
+-        "### 第一步：动态检索式设计（多维度并行）\n"
+-        "针对用户提出的研究主题，设计以下三类搜索串并同时发起（根据用户主题动态替换核心变量，严禁照搬示例）：\n"
+-        "  (a) 核心变量检索：『核心自变量 + 因变量 + 实证/检验』\n"
+-        "  (b) 机制路径检索：『核心自变量 + 常见中介变量 + 中介效应』\n"
+-        "  (c) 顶刊定向检索：『核心自变量 + 顶刊名称』\n\n"
+-        
+-        "### 第二步：文献初筛与分类\n"
+-        "阅读搜索结果中的标题和摘要，将文献分为两类分别处理：\n"
+-        "  - 实证类文献：提取五要素（作者年份 | 样本区间 | 核心结论 | 中介/调节变量 | 异质性发现），缺项则标记为'信息不全'并降级使用，不直接弃用。\n"
+-        "  - 理论类/综述类文献：提取核心构念定义和理论框架/演进脉络，不受五要素限制，优先保留。\n\n"
+-        
+-        "### 第三步：滚雪球扩展（后向追溯）\n"
+-        "从初筛得到的高质量文献中，提取其参考文献列表中的经典著作或标志性论文，进行第二轮补充检索，确保不遗漏领域基石。\n\n"
+-        
+-        "### 第四步：构建文献对比矩阵（内部记忆，不落盘）\n"
+-        "在思维中整理结构化对比表格（列：作者年份、样本、结论、中介、异质性、类型）。此矩阵仅保存在对话上下文中，严禁调用 write_file 写入磁盘。若用户要求核对文献质量，可在回复中直接打印 Markdown 表格供其审阅，但不生成实体文件。\n\n"
+-        
+-        "### 第五步：三段式深度叙事\n"
+-        "基于对比矩阵，按以下三段式结构撰写综述正文（严禁平铺直叙罗列摘要）：\n"
+-        "  - 共识：哪些结论被多篇高质量文献共同证实？形成共识的样本/方法基础是什么？\n"
+-        "  - 分歧：哪些结论存在显著冲突？分歧的深层根源是什么（样本区间、模型设定、变量度量、制度背景变化等）？\n"
+-        "  - 展望：现有研究的空白/局限是什么？未来可能突破的方向或待引入的新视角/新方法是什么？\n"
+-        "呈现约束：上述三段式仅作为内在逻辑结构，严禁在最终正文中使用'共识区''分歧区''展望区'作为小标题或显式字段。必须通过自然段落过渡体现逻辑推进，让结构隐形于论述之中。\n\n"
+-        
+-        "### 第六步：反幻觉自检与终稿输出\n"
+-        "输出终稿前，逐条核对参考文献：确保每个(作者,年份)都能在对比矩阵或搜索结果中找到对应记录。无来源者立即删除。自检完成后，直接在聊天框中输出综述全文。仅当用户明确要求保存（如'存下来''保存到本地'）时，才调用 write_file 写入单个 .md 文件，并告知存储路径。"
++        "你是一位学术综述专家。针对用户给定的主题撰写高质量文献综述（目标篇幅按用户要求，默认800-2000字）。\n\n"
++        "执行流程（严格按顺序）：\n"
++        "1. **多轮检索**：先用 tavily_search 做至少 2-3 次不同角度的检索（如『主题+综述/评估框架』、『主题+open source/工程实践』、『主题+研究进展』），每次检索后阅读标题/摘要筛选相关文献。\n"
++        "2. **结构规划**：在写作前先规划综述结构（概念界定→共识→分歧→展望），随后按结构展开写作。\n"
++        "3. **写作要求**：\n"
++        "   - 每篇引用必须来自检索结果，禁止编造不存在的论文/数据/引文；检索不到的细节明确标注『未检索到』。\n"
++        "   - 结构上避免机械列点，用自然段落推进：先界定概念，再总结共识，接着呈现分歧并分析根源，最后展望未来方向。\n"
++        "   - 语言专业、有深度，避免空话套话。\n"
++        "4. **反幻觉自检**：终稿前逐条核对引用是否能在检索结果中找到来源，找不到的立即删除。\n"
++        "5. 直接输出综述全文。仅当用户明确要求保存时才调用 write 写入 .md 文件。"
+     ),
+-    tools=[ "tavily_search", "tavily_extract", "read", "write", "edit", "bash", "grep", "glob"],
+-    temperature=0.25,
+-    max_iterations=20,
++    tools=["tavily_search", "tavily_extract", "read", "write", "edit", "bash", "grep", "glob"],
++    temperature=0.4,
++    max_iterations=25,
++    description="文献综述/学术综述：围绕主题检索文献并撰写有深度的综述文章",
++    keywords=["综述", "文献综述", "review the literature", "literature review", "survey", "研究现状", "进展", "overview", "评述"],
+ ))
