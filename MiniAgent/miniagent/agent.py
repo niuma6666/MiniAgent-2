@@ -43,6 +43,14 @@ _DANGEROUS_PATTERNS = [
 
 _DANGEROUS_RE = re.compile("|".join(_DANGEROUS_PATTERNS), re.IGNORECASE)
 
+# CCFA skill 输出约定中的结构化元数据块起始键（正文之后附加的 Mode/Artifact/
+# Warnings/Next 等键值信息，不属于用户要求的正文，不应计入字数统计）。
+_CCFA_META_KEYS = (
+    "Mode:", "Artifact returned:", "Artifact:", "Defensive content removed:",
+    "Smoke tests retained / removed:", "Publication method version status:",
+    "Warnings not inserted into artifacts:", "Warnings:", "Next CCFA owner:", "Next:",
+)
+
 class MiniAgent:
     """
     Main MiniAgent class, providing core functionality for LLM interaction and tool calling
@@ -70,6 +78,7 @@ Available tools: {tools_prompt}
    - For factual, recent, or verifiable info (news, data, citations), ALWAYS use tavily_search or web_search first.
    - Use internal knowledge only for common sense, or if search returns nothing.
    - If unsure about a citation, verify via search before quoting.
+   - Tool errors (timeouts, API failures, "error" responses) are for your debugging only — never include them in the final answer text.
 
 3. **Batch search** (for efficiency):
    - Combine multiple related queries with ` | ` (OR) in one call, e.g., `"paper A" | "paper B"`.
@@ -90,7 +99,11 @@ Available tools: {tools_prompt}
    - Only proceed if the user agrees. If the user didn't explicitly request a file, output the content directly in your response instead.
    - This rule does NOT apply to reading files, searching, or running non-destructive commands.
 
-7. **Interpersonal skills**:
+7. **One-off calculations**:
+   - For quick calculations (counting characters/words, simple math), use an inline `python -c "..."` one-liner. NEVER create temporary script files (e.g. `/tmp/count_chars.py`) for one-off tasks — on Windows `/tmp` does not exist and the write will fail.
+   - Avoid pasting large text blocks into shell commands (escaping/quoting errors, noisy logs); prefer reading files with the read tool.
+
+8. **Interpersonal skills**:
    - Greet briefly when appropriate.
    - If request is vague, ask clarifying questions BEFORE using tools.
    - Acknowledge user's emotions (e.g., "I understand you're looking for...").
@@ -114,6 +127,7 @@ You have the following tools available (use them via the tool-calling interface,
 2. **When to search**:
    - For factual, recent, or verifiable info (news, data, citations), ALWAYS use tavily_search or web_search first.
    - Use internal knowledge only for common sense, or if search returns nothing.
+   - Tool errors (timeouts, API failures, "error" responses) are for your debugging only — never include them in the final answer text.
 
 3. **Response & Termination**:
    - After executing a tool, explain the result clearly.
@@ -128,6 +142,10 @@ You have the following tools available (use them via the tool-calling interface,
 5. **File writing safety**:
    - Before using `write` or `edit` tools to create or modify files, ALWAYS ask the user for confirmation first.
    - Only proceed if the user agrees. If the user didn't explicitly request a file, output the content directly in your response instead.
+
+6. **One-off calculations**:
+   - For quick calculations (counting characters/words), use an inline `python -c "..."` one-liner. NEVER create temporary script files (e.g. `/tmp/count_chars.py`) for one-off tasks — on Windows `/tmp` does not exist.
+   - Avoid pasting large text blocks into shell commands; prefer reading files with the read tool.
 
 Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess."""
 
@@ -147,6 +165,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         confirm_file_writes: Optional[bool] = None,
         auto_route_skills: bool = True,
         llm_route_skills: Optional[bool] = None,
+        max_context_messages: Optional[int] = None,
+        tool_result_limit: Optional[int] = None,
         **kwargs
     ):
         """
@@ -164,12 +184,14 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             confirm_file_writes: If True, write/edit tool calls require user confirmation
                 before touching the filesystem (default: env CONFIRM_FILE_WRITES, or True).
             auto_route_skills: If True, automatically load a matching skill from the user's
-                query before the agent loop starts (no longer relies on the LLM deciding
-                on its own to call use_skill).
+                query before the agent loop starts (the only skill-loading mechanism:
+                LLM routing first, keyword scoring as fallback, see llm_route_skills).
             llm_route_skills: If True, skill routing is decided by the LLM (send the skill
                 list + user query to the model, it picks one skill or "none"), with the
                 keyword scoring system only as a fallback when the LLM call fails or its
                 answer is unparseable. Defaults to env LLM_ROUTE_SKILLS (enabled unless "0").
+            max_context_messages: 消息数超过此值自动压缩历史（默认 env MAX_CONTEXT_MESSAGES=20）。
+            tool_result_limit: 工具结果回传给 LLM 的最大字符数（默认 env TOOL_RESULT_LIMIT=800000）。
             **kwargs: Additional parameters for the OpenAI client
         """
         self.model = model
@@ -184,21 +206,6 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         if llm_route_skills is None:
             llm_route_skills = os.environ.get("LLM_ROUTE_SKILLS", "1").lower() not in ("0", "false", "no")
         self.llm_route_skills = llm_route_skills
-
-        
-
-        # ========== 插入开始：注入 Skill 目录到 system_prompt ==========
-        from .skills import _SKILLS
-        skills_catalog_parts = []
-        for name, skill in _SKILLS.items():
-            desc = skill.description or "无描述"
-            skills_catalog_parts.append(f"- {name}: {desc}")
-        if skills_catalog_parts:
-            skills_catalog = "\n".join(skills_catalog_parts)
-            self.system_prompt = self.system_prompt + "\n\n## 可用技能 (Available Skills)\n" + skills_catalog + "\n当用户问题匹配某技能时，可调用 use_skill 工具加载。"
-        # ========== 插入结束 ==========
-
-        
 
         self.tools = []
         self.client = None
@@ -216,9 +223,15 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         self._tools_prompt_cache: Optional[str] = None
         self._tools_prompt_cache_key: Optional[tuple] = None
         
-        # Cache config limits (read env vars once, not per-request)
-        self._max_context_messages = int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
-        self._tool_result_limit = int(os.environ.get("TOOL_RESULT_LIMIT", "800000"))     #16000改到800000，同步改.env文件
+        # Cache config limits（优先用调用方传入的值——cli 从 config 装配；否则读 env）
+        self._max_context_messages = (
+            max_context_messages if max_context_messages is not None
+            else int(os.environ.get("MAX_CONTEXT_MESSAGES", "20"))
+        )
+        self._tool_result_limit = (
+            tool_result_limit if tool_result_limit is not None
+            else int(os.environ.get("TOOL_RESULT_LIMIT", "800000"))
+        )
         
         # Initialize the LLM client
         self._init_llm_client()
@@ -230,26 +243,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             self.reflector = None
 
 
-        # ==================== 【改动 1 插入开始】 ====================
-        # 注册内置的 use_skill 工具
-        self.add_tool({
-            "name": "use_skill",
-            "description": "加载指定名称的技能。当用户的问题匹配某个特定技能（如 coder、researcher、literature_reviewer）时，调用此工具加载其完整指引。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": {
-                        "type": "string",
-                        "description": "技能名称，例如 'coder', 'researcher', 'literature_reviewer'"
-                    }
-                },
-                "required": ["skill_name"]
-            },
-            "executor": self._use_skill_handler  # 指向下面的处理方法
-        })
-        # 初始化一个占位，用于存储当前加载的技能
+        # 初始化当前加载的技能（由自动路由或 load_skill 设置）
         self._loaded_skill = None
-        # ==================== 【改动 1 插入结束】 ====================
 
         
         logger.info(f"MiniAgent initialized, model: {model}, base URL: {base_url or 'default'}, temperature: {temperature}, reflector: {use_reflector}")
@@ -327,15 +322,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         """
         return list(get_registered_tools().keys())
 
-    def load_all_tools(self) -> None:
-        """Load all registered built-in tools into this agent."""
-        for name in self.get_available_tools():
-            self.load_builtin_tool(name)
 
-
-    
-    
-    
     # ==================== 【改动 2 插入开始】 ====================
     
     def _reset_skill_state(self):
@@ -354,34 +341,34 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
     
     
     
-    def _use_skill_handler(self, **kwargs) -> str:
+    def load_skill(self, skill_name: str) -> bool:
         """
-        处理 use_skill 工具调用的执行器。
-        只负责加载 Skill 对象并暂存到 self._loaded_skill，不修改 messages。
-        主循环会检测到这个变量并注入 prompt。
-        """
+        加载指定名称的技能：应用其 prompt / 工具白名单 / 温度到当前 agent。
 
+        供 orchestrator 等外部调用（等价于旧 use_skill 工具的执行逻辑，
+        但不再依赖 LLM 主动调用工具——自动路由已覆盖该职责）。
+        注意：不修改 messages，主循环会在构建 system prompt 时注入技能 prompt。
+
+        Args:
+            skill_name: 已注册的技能名（如 'coder'、'ccf-humanization'）。
+
+        Returns:
+            True 表示加载成功，False 表示技能不存在。
+        """
         from .skills import get_skill, _SKILLS
-        
-        start = time.perf_counter()
-        skill_name = kwargs.get("skill_name") or kwargs.get("skill")  # 从 kwargs 提取
 
         skill = get_skill(skill_name)
         if not skill:
-            # 修复：加载失败不应清空已加载的 skill 状态（原代码调用 _reset_skill_state 会误清）
             console.print(f"[dim]❌ Skill load FAILED: '{skill_name}' (not found)[/dim]")
-            return f"错误：未找到技能 '{skill_name}'。可用技能：{list(_SKILLS.keys())}"
-    
+            logger.warning(f"Skill not found: {skill_name}; available: {list(_SKILLS.keys())}")
+            return False
+
         self._loaded_skill = skill
         self._skill_tool_whitelist = skill.tools
         if skill.temperature is not None:
             self.temperature = skill.temperature
-
-        elapsed = time.perf_counter() - start
-        console.print(f"[dim]✅ SKILL LOADED: '{skill_name}' | temp={self.temperature} | tools_whitelist={self._skill_tool_whitelist} | max_iter={skill.max_iterations} | elapsed={elapsed:.3f}s[/dim]")
-        
-        return f"✅ 成功加载技能 '{skill_name}'。请根据该技能的指引执行任务。"
-    # ==================== 【改动 2 插入结束】 ====================
+        console.print(f"[dim]✅ SKILL LOADED: '{skill_name}' | temp={self.temperature} | tools_whitelist={self._skill_tool_whitelist} | max_iter={skill.max_iterations}[/dim]")
+        return True
 
 
     def _get_filtered_tools(self) -> List[Dict]:
@@ -635,9 +622,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         args = tool_call.get("arguments", {})
 
 
-        # 原有白名单校验...
-        if (tool_name != "use_skill" 
-            and self._loaded_skill is not None 
+        # 白名单校验（技能加载后，只允许白名单内的工具）
+        if (self._loaded_skill is not None 
             and self._skill_tool_whitelist is not None 
             and tool_name not in self._skill_tool_whitelist):
             elapsed = time.perf_counter() - start
@@ -659,13 +645,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             if tool_callback:
                 tool_callback("end", tool_name, {"result": result})
             elapsed = time.perf_counter() - start
-        
 
-            # 关键：区分是否 use_skill
-            if tool_name == "use_skill":
-                console.print(f"[dim]🧠 SKILL TOOL CALL: {tool_name} args={str(args)[:80]} elapsed={elapsed:.3f}s[/dim]")
-            else:
-                console.print(f"[dim]🔧 TOOL CALL: {tool_name} args={str(args)[:80]} elapsed={elapsed:.3f}s[/dim]")
+            console.print(f"[dim]🔧 TOOL CALL: {tool_name} args={str(args)[:80]} elapsed={elapsed:.3f}s[/dim]")
             return result
 
         except Exception as e:
@@ -928,6 +909,59 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         logger.info(f"Executing tool: {tool_call['name']} with args: {tool_call['arguments']}")
         result = self._execute_tool(tool_call, tool_callback=tool_callback)
         return smart_truncate(str(result), limit), False
+
+    # ------------------------------------------------------------------
+    # 共享的收尾/判断助手（text 与 native 两种 run 模式复用，消除重复）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_complete_response(content: str) -> bool:
+        """启发式：无工具调用时判断响应是否已完整（足够长且无"未完成"暗示）。"""
+        return len(content) > 100 and not any(
+            kw in content for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]
+        )
+
+    @staticmethod
+    def _is_tool_error(result_str: str) -> bool:
+        """判断工具结果是否包含错误信息。
+
+        用于把"工具执行出错"与正常结果区分开：出错信息只应指导模型下一步，
+        绝不允许被写进最终回答（否则会出现综述正文开头写"错误排查指南"的跑题幻觉）。
+        识别范围：error/exception/traceback/timeout/超时/失败 等关键词，以及
+        MCP 风格的 dict 错误（{'error': ...}）。
+        """
+        if not isinstance(result_str, str):
+            return False
+        s = result_str.strip().lower()
+        if not s or s in ("ok", "✓"):
+            return False
+        return (
+            s.startswith("error") or s.startswith("错误") or s.startswith("[错误]")
+            or "'error'" in s or '"error"' in s
+            or "exception" in s or "traceback" in s
+            or "timed out" in s or "timeout" in s or "超时" in s
+            or "failed" in s or "失败" in s
+        )
+
+    @staticmethod
+    def _incomplete_feedback() -> str:
+        """无工具调用且响应不完整时追加给模型的引导消息。"""
+        return (
+            "当前回复没有工具调用且不完整。请调用工具获取信息，"
+            "或如果已足够，请以 FINAL_ANSWER: 开头给出最终回答。"
+        )
+
+    def _finalize_with_final_answer(self, content: str, query: str, messages: List[Dict]) -> str:
+        """处理以 FINAL_ANSWER: 开头的响应：剥离前缀并做字数约束收尾。"""
+        if content.strip().startswith("FINAL_ANSWER:"):
+            content = content[len("FINAL_ANSWER:"):].strip()
+        return self._finalize_response(content, query, messages)
+
+    def _force_finish(self, messages: List[Dict], max_iterations: int, query: str) -> str:
+        """超出迭代次数：强制生成最终回答并做字数约束收尾（两种 run 模式共用）。"""
+        return self._finalize_response(
+            self._force_final_answer(messages, max_iterations), query, messages
+        )
     
 
 
@@ -941,6 +975,20 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         """
         base = self._loaded_skill.prompt if self._loaded_skill else self.system_prompt
         if self._loaded_skill:
+            # 按需加载兜底：CCFA skill 以懒加载方式注册（prompt 为空、正文在
+            # prompt_file），首次使用前补读正文（幂等，已加载则直接跳过）；
+            # 读取失败则回退默认系统提示，避免空 prompt 跑对话。
+            if self._loaded_skill.prompt_file and not self._loaded_skill.prompt:
+                try:
+                    from .ccfa_loader import ensure_skill_prompt
+                    if ensure_skill_prompt(self._loaded_skill):
+                        base = self._loaded_skill.prompt
+                    else:
+                        base = self.system_prompt
+                        console.print(f"[dim]⚠️ skill '{self._loaded_skill.name}' 正文加载失败，回退默认提示[/dim]")
+                except Exception as e:
+                    logger.warning(f"按需加载 skill 正文失败: {e}")
+                    base = self.system_prompt
             console.print(f"[dim]📄 Using SKILL PROMPT: {self._loaded_skill.name}[/dim]")
         else:
             console.print(f"[dim]📄 Using DEFAULT SYSTEM PROMPT (no skill loaded)[/dim]")
@@ -955,18 +1003,57 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
     #============新增两个方法，改进 run_with_tools 与 run_with_native_tools 大量重复 的问题
 
-    def _init_run(self, query: str):
+    @staticmethod
+    def _current_query_text(query: str) -> str:
+        """从 cli 拼接的"历史+当前"query 中取出**当前用户消息**（供字数约束解析）。
+
+        cli 会把最近对话历史拼在 query 前面（以 "Conversation history
+        (most recent last):" 标记开头，每行形如 "user: ..." / "assistant: ..."）。
+        字数约束必须只解析当前这条消息——否则上一轮要求的"800字"会顺着历史
+        传染到本轮（如"润色"任务被强加原任务的字数）。最后一个 role 行之后
+        即当前消息；无历史标记时整段即当前消息。
+        """
+        marker = "Conversation history (most recent last):"
+        if marker not in query:
+            return query
+        after = query[query.rfind(marker) + len(marker):]
+        lines = after.split("\n")
+        last_role = -1
+        for i, line in enumerate(lines):
+            if line.startswith(("user: ", "assistant: ")):
+                last_role = i
+        if last_role >= 0:
+            return "\n".join(lines[last_role + 1:]).strip()
+        return after.strip()
+
+    def _init_run(self, query: str, force_skill: Optional[str] = None,
+                  length_constraint_override=None):
         """
         初始化每次运行的公共环境：重置技能状态、初始化消息列表、获取限制参数
+
+        Args:
+            query: 用户消息（cli 场景为"历史+当前"拼接）
+            force_skill: 非 None 时跳过自动路由，强制加载指定 skill（流水线阶段用）
+            length_constraint_override: 非 None 时用该值作为字数约束（流水线后续
+                阶段继承主阶段约束），否则从当前消息解析
         """
         self._reset_skill_state()
-        # ===== 自动路由：根据用户提问自动加载匹配的 skill =====
-        if self.auto_route_skills:
+        # ===== 技能加载：优先 force_skill（流水线阶段），否则自动路由 =====
+        if force_skill:
+            if not self.load_skill(force_skill):
+                logger.warning(f"Pipeline force_skill 加载失败: {force_skill}，回退自动路由")
+                if self.auto_route_skills:
+                    self._auto_route_skill(query)
+        elif self.auto_route_skills:
             self._auto_route_skill(query)
         logger.info(f"Starting query: {query[:50]}...")
 
-        # ===== 字数约束：从 query 解析（如 "800字" / "2000 words"）并强注入 =====
-        self._length_constraint = self._extract_length_constraint(query)
+        # ===== 字数约束：优先 override；否则只从**当前消息**解析（如 "800字"）=====
+        # 用 _current_query_text 隔离 cli 拼接的历史，避免上一轮的字数要求跨轮传染
+        if length_constraint_override is not None:
+            self._length_constraint = length_constraint_override
+        else:
+            self._length_constraint = self._extract_length_constraint(self._current_query_text(query))
         user_content = query
         if self._length_constraint:
             target, is_words = self._length_constraint
@@ -1016,6 +1103,23 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         return len(re.sub(r"\s+", "", text))
 
     @staticmethod
+    def _strip_skill_metadata(text: str) -> str:
+        """剥离 CCFA skill 输出约定中的结构化元数据块（Mode/Artifact/Warnings/Next 等）。
+
+        元数据块通常从第一个元数据键开始延续到文本末尾，如：
+            "Mode: manuscript-humanization | Artifact: ... | Warnings: ... | Next: ..."
+        统计字数/压缩前剥离，避免把元数据计入正文字数（正文达标却被误判超长、
+        误触发压缩）。未命中任何键时原样返回。
+        """
+        if not text:
+            return text
+        for key in _CCFA_META_KEYS:
+            idx = text.find(key)
+            if idx > 0:  # 键出现在正文之后（不在开头），剥离其后内容
+                return text[:idx].rstrip()
+        return text
+
+    @staticmethod
     def _truncate_to_length(text: str, max_len: int, is_words: bool) -> str:
         """在句子/段落边界把文本截断到目标长度（兜底用，不破坏 markdown 结构）。"""
         if is_words:
@@ -1048,18 +1152,21 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             return response
         target, is_words = constraint
         unit = "words" if is_words else "字"
-        cur = self._text_length(response, is_words)
+        # 先剥离 CCFA skill 元数据块再统计——否则 Mode/Artifact/Warnings 等结构化
+        # 输出会被算进字数，导致正文达标却被误判超长、误触发一轮无谓压缩
+        content = self._strip_skill_metadata(response)
+        cur = self._text_length(content, is_words)
         if cur <= target * 1.15:
             return response
 
         console.print(f"[dim]📏 回答约 {cur} {unit}，超出要求 {target} {unit}，正在压缩…[/dim]")
-        # 把待压缩原文放进消息，保证模型能看到（FINAL_ANSWER 分支的回答尚未进入历史）
-        if len(response) <= 8000:
+        # 把待压缩正文放进消息，保证模型能看到（FINAL_ANSWER 分支的回答尚未进入历史）
+        if len(content) <= 8000:
             comp_msg = (
                 f"用户只要求约 {target} {unit}（允许 ±15%），但你刚才的回答约 {cur} {unit}，超长了。\n"
                 f"请将下面的回答压缩到 {target} {unit} 左右（{int(target * 0.85)}–{int(target * 1.15)} {unit}），"
                 f"保留核心观点与必要引用，删掉冗余展开和重复表述，保持结构完整。\n\n"
-                f"=== 待压缩的回答 ===\n{response}\n=== 结束 ===\n\n"
+                f"=== 待压缩的回答 ===\n{content}\n=== 结束 ===\n\n"
                 f"直接输出压缩后的最终回答，并以 FINAL_ANSWER: 开头，不要再调用任何工具。"
             )
         else:
@@ -1096,8 +1203,22 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         if not _SKILLS:
             return None, False
 
+        # 家族信号：query 提到 ccf/ccfa（如 "用ccfa skills里适当的skill"）时，
+        # 只把 CCFA 家族成员交给模型选择，内置 skill 不参与——与评分系统
+        # match_skill 的 family 逻辑保持一致，避免模型无视用户明确的家族意图
+        # 而选走内置 skill（例：用户要 ccfa 文献综述却被选到内置 literature_reviewer）。
+        q = query.lower()
+        family = "ccf" in q
+        items = [
+            (name, skill) for name, skill in sorted(_SKILLS.items(), key=lambda kv: kv[0])
+            if not family or name.startswith("ccf-")
+        ]
+        if not items:
+            # 家族信号但家族未注册（如未设置 CCFA_SKILLS_ROOT）：回退全量，避免空列表
+            items = sorted(_SKILLS.items(), key=lambda kv: kv[0])
+
         lines = []
-        for name, skill in sorted(_SKILLS.items(), key=lambda kv: kv[0]):
+        for name, skill in items:
             desc = (skill.description or "").replace("\n", " ").strip()
             if len(desc) > 160:
                 desc = desc[:160] + "…"
@@ -1117,6 +1238,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             "humanization skill, never a coding skill.\n"
             "- 'use the appropriate ccfa skill' is a meta instruction meaning 'pick the right "
             "one' — it is NOT a request to create a skill.\n"
+            "- If the user explicitly mentions 'ccfa'/'CCF-A' skills, pick only from the ccf-* "
+            "skills (built-ins were intentionally excluded from the list).\n"
             "- Generic chat or simple Q&A that no skill clearly fits → 'none'.\n"
             "- Only pick from the listed skill names; never invent new ones.\n\n"
             f"User request: {query}\n\n"
@@ -1143,8 +1266,10 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             return None, True
 
         # 精确/去分隔符匹配 skill 名（ccf-humanization / literature_reviewer 等）
+        # 只在交给模型的那份候选列表（items）里匹配——家族信号下内置 skill 未入列，
+        # 模型答内置名也会因匹配不到而回退评分系统，保证家族约束不被绕过。
         norm = lambda s: s.lower().replace("_", "").replace("-", "").replace(".", "")
-        for name, skill in _SKILLS.items():
+        for name, skill in items:
             if norm(name) == norm(raw):
                 logger.info(f"LLM routing: model picked '{name}'")
                 return skill, False
@@ -1216,7 +1341,163 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         except Exception as e:  # 加载失败不阻断主流程
             logger.warning(f"CCFA skills 懒加载失败: {e}")
 
+    # ------------------------------------------------------------------
+    # 意图流水线：把 query 拆成"主意图 skill + 附加意图 skill 序列"并依次执行
+    # ------------------------------------------------------------------
 
+    # 附加意图动作词 → skill 名（兜底：query 未显式点名 skill 时按语义追加）
+    _SECONDARY_INTENT_KEYWORDS = [
+        (("humaniz", "润色", "去ai味", "去 ai 味", "去机器味", "打磨", "polish"), "ccf-humanization"),
+        (("审计", "核查", "查证", "校验", "integrity"), "ccf-integrity-auditor"),
+        (("检索", "搜文献", "查文献", "literature search"), "ccf-literature-searcher"),
+        (("监控", "跟踪文献", "literature monitor"), "ccf-literature-monitor"),
+        (("图表", "绘图", "可视化", "visual"), "ccf-visual-composer"),
+        (("答辩", "回复审稿", "rebuttal"), "ccf-rebuttal-writer"),
+        (("投稿", "submission"), "ccf-submission-checker"),
+    ]
+
+    def _extract_skill_pipeline(self, query: str) -> List[str]:
+        """把 query 拆成"主意图 skill + 附加意图 skill"的有序序列（去重）。
+
+        规则：
+        - **产出型 skill**（paper-writer / literature-searcher / experiment-designer 等）
+          被显式点名时 → 直接作为主意图（用户指定用什么干活）。
+        - **处理型 skill**（humanization / integrity-auditor / rebuttal-writer —— 对已有
+          内容做润色/审计/答辩）被点名，或 query 命中意图动作词（润色/审计/检索...）
+          → 作为附加意图。
+        - 无显式产出型点名时：先从 query 剥离附加意图信号（避免强意图正则如
+          "humaniz\w*" 短路把"写综述+润色"整条抢成 humanization），用剩余文本
+          走常规路由（LLM 路由为主，评分兜底）得主意图。
+
+        Returns:
+            skill 名列表；无匹配时返回空列表。
+        """
+        from .skills import _SKILLS, get_skill, match_skill
+        self._ensure_ccfa_loaded()
+
+        q = query.lower()
+        # 处理型 skill：显式点名时优先视为"附加意图"（对主产出做二次处理）
+        processing = {"ccf-humanization", "ccf-integrity-auditor", "ccf-rebuttal-writer"}
+
+        # ---- 1) 收集信号 ----
+        named_main: List[str] = []       # 显式点名的产出型 skill → 主意图候选
+        secondary: List[str] = []        # 附加意图（处理型点名 + 动作词兜底）
+        for name in sorted(_SKILLS.keys()):
+            if not name.startswith("ccf-"):
+                continue
+            short = name.split("-", 1)[1]  # ccf-humanization -> humanization
+            if short in q or name in q:
+                if name in processing:
+                    secondary.append(name)
+                else:
+                    named_main.append(name)
+        for kws, skill_name in self._SECONDARY_INTENT_KEYWORDS:
+            if skill_name in _SKILLS and skill_name not in named_main and skill_name not in secondary \
+                    and any(kw in q for kw in kws):
+                secondary.append(skill_name)
+
+        # ---- 2) 确定主意图 ----
+        main_skill = None
+        if named_main:
+            # 用户显式点名的产出型 skill 直接作主
+            main_skill = get_skill(named_main[0])
+        else:
+            # 剥离附加意图信号后路由
+            stripped = query
+            for name in secondary:
+                short = name.split("-", 1)[1]
+                stripped = stripped.replace(name, " ").replace(short, " ")
+            for kws, _sn in self._SECONDARY_INTENT_KEYWORDS:
+                for kw in kws:
+                    stripped = stripped.replace(kw, " ")
+            stripped = re.sub(r"\s+", " ", stripped).strip()
+
+            if stripped and stripped.lower() != query.lower():
+                if self.llm_route_skills:
+                    try:
+                        skill, explicit_none = self._route_skill_via_llm(stripped)
+                        if not explicit_none:
+                            main_skill = skill
+                    except Exception as e:
+                        logger.warning(f"LLM routing failed ({e}); falling back to scoring system")
+                        main_skill = None
+                if main_skill is None:
+                    main_skill = match_skill(stripped)
+            if main_skill is None:
+                # 回退：原始 query 常规路由
+                if self.llm_route_skills:
+                    try:
+                        skill, explicit_none = self._route_skill_via_llm(query)
+                        if not explicit_none:
+                            main_skill = skill
+                    except Exception as e:
+                        logger.warning(f"LLM routing failed ({e}); falling back to scoring system")
+                        main_skill = None
+                if main_skill is None:
+                    main_skill = match_skill(query)
+        if main_skill is None:
+            return []
+
+        # ---- 3) 组合：主在前，附加按序在后（去重） ----
+        pipeline: List[str] = [main_skill.name]
+        for s in named_main[1:] + secondary:
+            if s != main_skill.name and s not in pipeline:
+                pipeline.append(s)
+        return pipeline
+
+    def _run_with_mode(self, query: str, max_iterations: int,
+                       tool_callback, status_callback, stream_callback, mode: str,
+                       force_skill: Optional[str] = None, length_constraint_override=None) -> str:
+        """按 mode 调度到 text/native 运行入口（带流水线参数）。"""
+        if mode == "native":
+            return self.run_with_native_tools(
+                query, max_iterations, tool_callback, status_callback,
+                force_skill=force_skill, length_constraint_override=length_constraint_override,
+            )
+        return self.run_with_tools(
+            query, max_iterations, tool_callback, status_callback, stream_callback,
+            force_skill=force_skill, length_constraint_override=length_constraint_override,
+        )
+
+    def run_pipeline(self, query: str, max_iterations: int = 10,
+                     tool_callback=None, status_callback=None,
+                     stream_callback=None, mode: str = "text") -> str:
+        """按用户意图执行：单意图等价于现有 run_with_tools/native；多意图时
+        按主意图 skill → 附加意图 skill 的顺序分阶段执行（每阶段一个完整 run，
+        前一阶段的结果作为后一阶段的输入）。
+
+        Args:
+            query: 用户消息
+            max_iterations: 每阶段最大迭代数
+            mode: "text" 或 "native"
+        """
+        skills = self._extract_skill_pipeline(query)
+        if len(skills) <= 1:
+            return self._run_with_mode(query, max_iterations, tool_callback,
+                                       status_callback, stream_callback, mode)
+
+        results: List[str] = []
+        prev_result: Optional[str] = None
+        stage_constraint = None
+        for idx, skill_name in enumerate(skills):
+            if idx > 0 and not prev_result:
+                logger.warning("Pipeline: 前一阶段无输出，终止后续阶段")
+                break
+            # 阶段 1 用原始 query；后续阶段用前一阶段的结果作为输入
+            stage_query = query if idx == 0 else prev_result or ""
+            # 字数约束：阶段 1 从 query 解析；后续阶段继承阶段 1 的约束
+            # （润色等后续阶段保持主阶段的字数要求）
+            override = stage_constraint if idx > 0 else None
+            logger.info(f"Pipeline stage {idx + 1}/{len(skills)}: skill={skill_name}")
+            r = self._run_with_mode(stage_query, max_iterations, tool_callback,
+                                    status_callback, stream_callback, mode,
+                                    force_skill=skill_name,
+                                    length_constraint_override=override)
+            if idx == 0:
+                stage_constraint = getattr(self, "_length_constraint", None)
+            results.append(r)
+            prev_result = r
+        return prev_result if prev_result is not None else (results[0] if results else "")
 
     def _force_final_answer(self, messages: List[Dict], max_iterations: int) -> str:
         """
@@ -1245,12 +1526,16 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         tool_callback: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         stream_callback: Optional[Callable[[str], None]] = None,
+        force_skill: Optional[str] = None,
+        length_constraint_override=None,
     ) -> str:
 
          
        
         # ===== 替换初始化代码 =====
-        messages, max_ctx, limit = self._init_run(query)
+        messages, max_ctx, limit = self._init_run(
+            query, force_skill=force_skill, length_constraint_override=length_constraint_override
+        )
 
 
         # 使用 for 循环自动管理迭代次数
@@ -1277,9 +1562,7 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
             # 检测 FINAL_ANSWER
             if response.strip().startswith("FINAL_ANSWER:"):
-                return self._finalize_response(
-                    response[len("FINAL_ANSWER:"):].strip(), query, messages
-                )
+                return self._finalize_with_final_answer(response, query, messages)
 
             messages.append({"role": "assistant", "content": response})
 
@@ -1289,43 +1572,36 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             # 无工具调用
             if not tool_calls:
                 # 启发式判断：若响应足够长且无"未完成"暗示，视为完成
-                if len(response) > 100 and not any(kw in response for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]):
+                if self._is_complete_response(response):
                     logger.info("No tool call but response seems complete, returning.")
                     return self._finalize_response(response, query, messages)
                 # 否则引导
                 messages.append({
                     "role": "user",
-                    "content": "当前回复没有工具调用且不完整。请调用工具获取信息，或如果已足够，请以 FINAL_ANSWER: 开头给出最终回答。"
+                    "content": self._incomplete_feedback(),
                 })
                 continue  # 下一轮
 
             # 依次执行所有工具调用
             for tool_call in tool_calls:
-                # 处理 use_skill
-                if tool_call["name"] == "use_skill":
-                    result_str = self._use_skill_handler(**tool_call["arguments"])
-                    messages.append({
-                        "role": "user",
-                        "content": f"工具 '{tool_call['name']}' 执行结果：{result_str}"
-                    })
-                    continue  # 下一个工具
-
-                # 执行其他工具
                 result_str, rejected = self._safe_execute_tool(tool_call, tool_callback, status_callback, limit)
 
                 if rejected:
                     feedback = f"用户拒绝了工具 '{tool_call['name']}'，请建议安全的替代方案或用中文回答。"
-                elif isinstance(result_str, str) and ("Error" in result_str or "Exception" in result_str):
-                    feedback = f"工具 '{tool_call['name']}' 出错：{result_str}\n请解释错误并给出解决方案。"
+                elif self._is_tool_error(result_str):
+                    feedback = (
+                        f"工具 '{tool_call['name']}' 执行出错：{result_str}\n"
+                        "该错误信息仅用于你判断下一步，与用户任务内容无关——不要把它写进最终回答，"
+                        "也不要向用户解释错误细节。若任务需要该信息，请重试或换一种方式获取；"
+                        "否则用已有信息继续完成回答。"
+                    )
                 else:
                     feedback = f"工具 '{tool_call['name']}' 结果：{result_str}\n请继续用中文回答，完成时以 FINAL_ANSWER: 开头。"
 
                 messages.append({"role": "user", "content": feedback})
 
-        # 超出迭代次数，强制生成最终答案（复用 _force_final_answer，避免重复逻辑）
-        return self._finalize_response(
-            self._force_final_answer(messages, max_iterations), query, messages
-        )
+        # 超出迭代次数，强制生成最终答案
+        return self._force_finish(messages, max_iterations, query)
 
 
 
@@ -1336,11 +1612,15 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         max_iterations: int = 10,
         tool_callback: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
+        force_skill: Optional[str] = None,
+        length_constraint_override=None,
     ) -> str:
 
         
         # ===== 替换初始化代码 =====
-        messages, max_ctx, limit = self._init_run(query)
+        messages, max_ctx, limit = self._init_run(
+            query, force_skill=force_skill, length_constraint_override=length_constraint_override
+        )
 
 
 
@@ -1380,21 +1660,19 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
             # 检测 FINAL_ANSWER
             if msg.content and msg.content.strip().startswith("FINAL_ANSWER:"):
-                return self._finalize_response(
-                    msg.content[len("FINAL_ANSWER:"):].strip(), query, messages
-                )
+                return self._finalize_with_final_answer(msg.content, query, messages)
 
             # 无工具调用：与 text 模式保持一致，判断响应是否完整
             if not msg.tool_calls:
                 content = (msg.content or "").strip()
                 # 响应足够长且无"未完成"暗示 → 视为完成
-                if len(content) > 100 and not any(kw in content for kw in ["需要查询", "需要搜索", "请稍等", "我会查找"]):
+                if self._is_complete_response(content):
                     return self._finalize_response(content, query, messages)
                 # 否则引导 LLM 继续（把本轮回复加入历史，避免原地打转）
                 messages.append(msg)
                 messages.append({
                     "role": "user",
-                    "content": "当前回复没有工具调用且不完整。请调用工具获取信息，或如果已足够，请以 FINAL_ANSWER: 开头给出最终回答。"
+                    "content": self._incomplete_feedback(),
                 })
                 continue
 
@@ -1407,24 +1685,22 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 except json.JSONDecodeError:
                     arguments = parse_json(tc.function.arguments) or {}
 
-                
-                if tool_name == "use_skill":
-                    result_str = self._use_skill_handler(**arguments)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_str,
-                    })
-                    # 注意：_loaded_skill 和 _skill_tool_whitelist 已更新，
-                    # 下一轮循环会使用新的过滤列表
-                    continue
-                
-
                 tool_call_info = {"name": tool_name, "arguments": arguments}
                 result_str, rejected = self._safe_execute_tool(
                     tool_call_info, tool_callback, status_callback, limit
                 )
-                content = "Execution rejected by user. Suggest a safer alternative." if rejected else result_str
+                if rejected:
+                    content = "Execution rejected by user. Suggest a safer alternative."
+                elif self._is_tool_error(result_str):
+                    content = (
+                        f"Tool '{tool_name}' returned an error: {result_str}. "
+                        "This error is for debugging only and is NOT part of the user's task — "
+                        "do not write it into the final answer or explain it to the user. "
+                        "Retry differently if the task needs it, otherwise continue with "
+                        "available information."
+                    )
+                else:
+                    content = result_str
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -1432,10 +1708,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 })
 
 
-        # ===== 替换结尾的强制回答代码（现在统一使用 _call_llm） =====
-        return self._finalize_response(
-            self._force_final_answer(messages, max_iterations), query, messages
-        )
+        # 超出迭代次数，强制生成最终回答
+        return self._force_finish(messages, max_iterations, query)
 
 
 
