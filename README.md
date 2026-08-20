@@ -1,5 +1,5 @@
 # MiniAgent-2
-让workbuddy搓了个agent出来
+让workbuddy和dsh搓了个agent出来
 
 
 agent框架来源：[ZhuLinsen/MiniAgent](https://github.com/ZhuLinsen/MiniAgent)
