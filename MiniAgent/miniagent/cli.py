@@ -155,7 +155,51 @@ def _status_callback(status_text: str) -> None:
     """Callback for updating the status spinner text."""
     global _current_status
     if _current_status:
+        # 流式打印期间转圈被 _StreamPrinter 停止过；新一轮 Thinking 前恢复。
+        # start() 幂等：转圈本来就在跑时是 no-op（与 _tool_callback 的用法一致）。
+        _current_status.start()
         _current_status.update(f"[dim]{status_text}[/dim]")
+
+
+class _StreamPrinter:
+    """有状态的流式打印回调。
+
+    - 逐 token 打印流式输出；
+    - 累积文本中出现 TOOL:/Tool:/工具: 块时停止打印（工具调用由
+      _tool_callback 单独展示，避免把 TOOL: 文本当作回答打印）；
+    - run_with_tools 会在每轮 LLM 调用前调用 reset()，因此工具调用之后的
+      最终答案 token 会**重新开始打印**——旧实现用闭包 flag 且永不重置，
+      一旦出现过 TOOL: 就"永久哑火"，观感上像流式没在输出。
+    """
+
+    def __init__(self) -> None:
+        self.chunks: List[str] = []
+        self.has_tool_call = False
+        self._status_stopped = False
+
+    def reset(self) -> None:
+        """新一轮 LLM 调用开始：清空累积文本与抑制标记。"""
+        self.chunks = []
+        self.has_tool_call = False
+        self._status_stopped = False
+
+    def __call__(self, token: str) -> None:
+        self.chunks.append(token)
+        # 检测工具调用块（本轮累积文本中出现即抑制后续打印）
+        partial = "".join(self.chunks)
+        if "TOOL:" in partial or "Tool:" in partial or "工具:" in partial:
+            self.has_tool_call = True
+            return
+        if not self.has_tool_call:
+            # 首次输出前停止转圈：Rich Status 是 transient Live，会捕获并每 80ms
+            # 重绘 console 输出——流式的半行 token 会被反复抹掉，Status 结束时
+            # 整个流式答案随区域一起从屏幕擦除。停掉转圈后 token 直接写终端，
+            # 逐字显示并永久留在屏幕上（_status_callback 会在下轮 Thinking 恢复）。
+            global _current_status
+            if _current_status and not self._status_stopped:
+                self._status_stopped = True
+                _current_status.stop()
+            console.print(token, end="", highlight=False)
 
 
 def _build_agent(args: argparse.Namespace) -> tuple[MiniAgent, Memory]:
@@ -379,23 +423,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             # 当前消息单独追加在末尾——否则同一句 user 输入会被拼进 query 两次。
             query = _format_history(history[:-1]) + user_text
             
-            # Prepare streaming callback
-            _stream_chunks: List[str] = []
-            _stream_has_tool_call = False
-            
-
-
-            def _stream_callback(token: str) -> None:
-                """Print streaming tokens, but suppress if it's a tool call block."""
-                nonlocal _stream_has_tool_call, _stream_chunks
-                _stream_chunks.append(token)
-                # Detect tool call patterns early and stop printing
-                partial = "".join(_stream_chunks)
-                if "TOOL:" in partial or "Tool:" in partial or "工具:" in partial:
-                    _stream_has_tool_call = True
-                    return
-                if not _stream_has_tool_call:
-                    console.print(token, end="", highlight=False)
+            # Prepare streaming callback（有状态；run_with_tools 每轮 LLM 调用前自动 reset）
+            stream_printer = _StreamPrinter()
 
             try:
                 # Show thinking indicator
@@ -417,7 +446,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 query,
                                 tool_callback=_tool_callback,
                                 status_callback=_status_callback,
-                                stream_callback=_stream_callback if use_streaming else None,
+                                stream_callback=stream_printer if use_streaming else None,
                                 mode="text",
                             )
                     finally:
@@ -433,7 +462,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             memory.push("assistant", response)
 
             # If streaming printed the final answer already, just add a newline
-            if use_streaming and _stream_chunks and not _stream_has_tool_call:
+            if use_streaming and stream_printer.chunks and not stream_printer.has_tool_call:
                 console.print()  # newline after streamed output
                 continue
 
