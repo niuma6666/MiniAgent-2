@@ -45,6 +45,10 @@ class Skill:
     description: str = ""
     # 路由关键词：命中用户提问即自动加载该 skill（解决"不能自主选择 skill"问题）
     keywords: List[str] = field(default_factory=list)
+    # 按需加载：prompt 正文的磁盘来源（如 SKILL.md 路径）。为 None 表示 prompt
+    # 已内联；设置了 prompt_file 时 prompt 可为空串，待技能被路由选中后再由
+    # ccfa_loader.ensure_skill_prompt() 读取正文（避免启动时全量驻留内存）。
+    prompt_file: Optional[str] = None
 
 
 def register_skill(skill: Skill) -> Skill:
@@ -123,6 +127,7 @@ _EN_STOPWORDS = {
     "were", "you", "your", "yours", "own", "its", "it", "this", "that", "these",
     "those", "from", "into", "main", "maintain", "maintaining", "only", "full",
     "before", "after", "keep", "keeping", "preserve", "creating", "create",
+    "e.g", "i.e",
     "requested", "they", "them", "their", "will", "would", "can", "could", "may",
     "might", "must", "should", "shall", "while", "where", "which", "who", "whom",
     "what", "when", "why", "how", "all", "any", "each", "every", "both", "some",
