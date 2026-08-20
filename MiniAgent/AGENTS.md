@@ -159,6 +159,7 @@ python -m pytest tests/ -v
 | `MAX_CONTEXT_MESSAGES` | 20 | 超过此数量自动压缩对话历史 |
 | `CONFIRM_DANGEROUS` | true | 是否拦截危险 bash 命令 |
 | `MINIAGENT_STREAM` | 1 | 是否启用流式输出（0=关闭） |
+| `LLM_STREAM_STALL_TIMEOUT` | 120 | 流式输出超过此秒数无数据则中止（防止无限挂起） |
 | `ENABLE_REFLECTION` | false | 是否启用反思机制 |
 | `REFLECTION_MAX_ITERATIONS` | 3 | 反思最大迭代次数 |
 | `SERPAPI_KEY` | — | SerpAPI 密钥（web_search 工具需要） |
