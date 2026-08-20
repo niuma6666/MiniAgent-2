@@ -21,36 +21,27 @@ logger = get_logger(__name__)
 
 @dataclass
 class LLMConfig:
-    """LLM configuration"""
+    """LLM configuration（只保留真正被消费的字段：cli 构造 MiniAgent 时使用）"""
     
     model: str = "gpt-3.5-turbo"
     api_key: Optional[str] = None
     api_base: Optional[str] = None
     organization: Optional[str] = None
-    timeout: Optional[int] = 60
     temperature: float = 0.7
-    max_tokens: Optional[int] = None
-    top_p: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    presence_penalty: Optional[float] = None
 
 @dataclass
 class AgentConfig:
-    """Agent configuration"""
+    """Agent configuration（字段与消费方一一对应：cli 构造 MiniAgent 时使用）"""
     
     llm: LLMConfig = field(default_factory=LLMConfig)
     system_prompt: str = "You are a helpful AI assistant."
     default_tools: List[str] = field(default_factory=list)
     enable_reflection: bool = False
-    reflection_system_prompt: Optional[str] = None
-    reflection_max_iterations: int = 3
-    
-    # Tool execution limits (configurable via env vars)
-    bash_timeout: int = 120          # BASH_TIMEOUT: bash default timeout in seconds
-    bash_max_output: int = 50000     # BASH_MAX_OUTPUT: bash output truncation limit
-    tool_result_limit: int = 16000   # TOOL_RESULT_LIMIT: tool result truncation limit
-    max_context_messages: int = 20   # MAX_CONTEXT_MESSAGES: auto-compress conversation after N messages
-    confirm_dangerous: bool = True   # CONFIRM_DANGEROUS: require confirmation for dangerous commands
+    # 工具执行限制（cli 传给 MiniAgent；bash 工具的 BASH_TIMEOUT/BASH_MAX_OUTPUT
+    # 由 code_tools.bash 直接读环境变量，此处不重复声明）
+    tool_result_limit: int = 800000   # TOOL_RESULT_LIMIT: 工具结果回传上限（与 agent 默认对齐）
+    max_context_messages: int = 20    # MAX_CONTEXT_MESSAGES: 消息数超限自动压缩
+    confirm_dangerous: bool = True    # CONFIRM_DANGEROUS: 危险 bash 命令需确认
 
 def load_config(config_path: Optional[str] = None) -> AgentConfig:
     """
@@ -105,6 +96,7 @@ def load_config(config_path: Optional[str] = None) -> AgentConfig:
         config.llm.model = env_model
     
     # Load tool execution limits from environment
+    # （BASH_TIMEOUT/BASH_MAX_OUTPUT 由 code_tools.bash 直接读取，此处不重复）
     def _safe_int(key: str, default: int) -> int:
         val = os.environ.get(key, "")
         if not val:
@@ -115,16 +107,12 @@ def load_config(config_path: Optional[str] = None) -> AgentConfig:
             logger.warning(f"Invalid integer for {key}={val!r}, using default {default}")
             return default
 
-    config.bash_timeout = _safe_int("BASH_TIMEOUT", config.bash_timeout)
-    config.bash_max_output = _safe_int("BASH_MAX_OUTPUT", config.bash_max_output)
     config.tool_result_limit = _safe_int("TOOL_RESULT_LIMIT", config.tool_result_limit)
     config.max_context_messages = _safe_int("MAX_CONTEXT_MESSAGES", config.max_context_messages)
     if os.environ.get("CONFIRM_DANGEROUS") is not None:
         config.confirm_dangerous = os.environ["CONFIRM_DANGEROUS"].lower() not in ("0", "false", "no")
     if os.environ.get("ENABLE_REFLECTION") is not None:
         config.enable_reflection = os.environ["ENABLE_REFLECTION"].lower() not in ("0", "false", "no")
-    if os.environ.get("REFLECTION_MAX_ITERATIONS"):
-        config.reflection_max_iterations = _safe_int("REFLECTION_MAX_ITERATIONS", config.reflection_max_iterations)
         
     # Determine likely provider based on API_BASE and set appropriate default model
     if config.llm.api_base:
