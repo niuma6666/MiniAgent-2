@@ -3,6 +3,7 @@
 import os
 import json
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Generator, List, Optional
 from tenacity import retry, stop_after_attempt, wait_random_exponential
@@ -253,9 +254,12 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
         """Initialize the LLM client (OpenAI-compatible for all providers)"""
         try:
             import openai as _openai
+            # timeout=300：兜底超时。流式时作用于"两次 chunk 之间"的等待，
+            # 防止服务端停发数据导致无限挂起（精确的停滞检测由 _call_llm_stream 的看门狗负责）。
             self.client = _openai.OpenAI(
                 api_key=self.api_key,
-                base_url=self.base_url
+                base_url=self.base_url,
+                timeout=300,
             )
             logger.info(f"LLM client initialized: model={self.model}, base_url={self.base_url or 'default'}")
         except ImportError:
@@ -715,13 +719,35 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
 
 
+    @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=60))
+    def _create_stream_response(self, messages: List[Dict[str, str]]):
+        """创建流式 LLM 响应（带 3 次重试）。
+
+        注意：必须是**普通函数**而非生成器——@retry 直接挂在生成器函数上时，
+        装饰器只包住"创建生成器"这一步，函数体要等迭代时才执行，迭代中抛出的
+        异常 @retry 根本捕获不到。把 create() 抽出来挂重试，才能覆盖
+        5xx / 429 / overloaded 等"请求阶段失败"（DeepSeek 高峰期主因）。
+        """
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            stream=True,
+        )
+
     def _call_llm_stream(self, messages: List[Dict[str, str]]) -> Generator[str, None, None]:
         """
         Call LLM with streaming, yielding tokens as they arrive.
-        
+
+        - 请求创建阶段失败 → _create_stream_response 自动重试（3 次）；
+        - 流式停滞（超过 LLM_STREAM_STALL_TIMEOUT 秒无任何数据）→ 看门狗
+          关闭底层流并抛错，绝不无限挂起；任意 chunk（含 deepseek-reasoner
+          的 reasoning_content）都算活跃，不会误杀长思考模型；
+        - 中途失败由 run_with_tools 兜底降级为非流式调用。
+
         Args:
             messages: Conversation messages
-            
+
         Yields:
             Token strings as they stream in
         """
@@ -729,20 +755,44 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
         if not self.api_key:
             raise ValueError("API key is not set.")
-        
+
         messages = self._maybe_reflect(messages)
-        
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            stream=True,
-        )
+
+        response = self._create_stream_response(messages)
+
+        # ===== 停滞看门狗 =====
+        # 超过 stall_timeout 秒没有任何 chunk（服务端停发数据）即中止。
+        stall_timeout = float(os.environ.get("LLM_STREAM_STALL_TIMEOUT", "120"))
+        progress = {"ts": time.monotonic(), "stalled": False}
+
+        def _watchdog():
+            while not progress["stalled"]:
+                time.sleep(1.0)
+                if time.monotonic() - progress["ts"] > stall_timeout:
+                    progress["stalled"] = True
+                    logger.warning(f"LLM stream stalled (no data for >{stall_timeout:.0f}s), aborting")
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+        watchdog = threading.Thread(target=_watchdog, daemon=True)
+        watchdog.start()
+
         try:
             for chunk in response:
+                progress["ts"] = time.monotonic()  # 任意 chunk 都算活跃
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta and delta.content:
                     yield delta.content
+
+            # 若看门狗已中止：底层流可能"干净结束"，这里必须显式抛错，
+            # 避免把截断的内容当作完整回答（由 run_with_tools 降级兜底）。
+            if progress["stalled"]:
+                raise TimeoutError(
+                    f"LLM 流式输出停滞（超过 {stall_timeout:.0f}s 无数据），已中止。"
+                )
 
             # <--- 正常流式结束，打印耗时（在循环外、try内部） --->
             elapsed = time.perf_counter() - start
@@ -754,6 +804,8 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
             logger.error(f"Streaming error during iteration: {e}")
             console.print(f"[dim]💥 LLM stream ({self.model}) failed in {elapsed:.3f}s: {str(e)[:60]}[/dim]")
             raise
+        finally:
+            progress["stalled"] = True  # 通知看门狗退出（daemon 线程，不阻塞退出）
 
 
 
@@ -1552,11 +1604,26 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
             # 获取模型响应
             if stream_callback:
-                chunks = []
-                for token in self._call_llm_stream(messages):
-                    chunks.append(token)
-                    stream_callback(token)
-                response = "".join(chunks)
+                # 新一轮 LLM 调用：重置流式显示状态（CLI 用，工具调用后恢复打印）
+                if hasattr(stream_callback, "reset"):
+                    stream_callback.reset()
+                try:
+                    chunks = []
+                    for token in self._call_llm_stream(messages):
+                        chunks.append(token)
+                        stream_callback(token)
+                    response = "".join(chunks)
+                except Exception as e:
+                    # 流式失败自动降级为非流式（_call_llm 自带 3 次重试），
+                    # 保证"流式挂了也一定有回答"。
+                    logger.warning(f"Streaming failed ({e}); falling back to non-streaming call")
+                    console.print(f"[dim]⚠️ 流式输出失败（{str(e)[:80]}），已降级为非流式重试[/dim]")
+                    response = self._call_llm(messages)
+                    # 流式可能已输出部分 token：清空回调累积状态，让调用方（CLI 的
+                    # _StreamPrinter）不再误判"答案已流式打印"，从而走完整展示路径
+                    # （Panel），避免降级后的完整回答被吞掉。
+                    if hasattr(stream_callback, "reset"):
+                        stream_callback.reset()
             else:
                 response = self._call_llm(messages)
 
@@ -1605,6 +1672,32 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
 
 
 
+
+    @staticmethod
+    def _message_to_dict(msg: Any) -> Dict[str, Any]:
+        """把 OpenAI 的 ChatCompletionMessage 转成普通 dict。
+
+        native 模式之前直接把 pydantic 消息对象 append 进 messages，导致历史里
+        混入非 dict：_summarize_messages 的 .get("role")/.get("content")（以及
+        reflector 的 ["role"] 下标）会在上下文压缩/反思时 AttributeError 崩溃，
+        长任务（CCFA skill max_iterations=30）必现。统一转 dict 与 text 模式一致，
+        同时 tool_calls 字段按 API 约定保留（assistant 消息带 tool_calls）。
+        """
+        d: Dict[str, Any] = {"role": "assistant", "content": getattr(msg, "content", None) or ""}
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            d["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": getattr(tc, "type", "function"),
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+        return d
 
     def run_with_native_tools(
         self,
@@ -1669,14 +1762,14 @@ Remember: Be accurate, concise, and human-like. If unsure, ask rather than guess
                 if self._is_complete_response(content):
                     return self._finalize_response(content, query, messages)
                 # 否则引导 LLM 继续（把本轮回复加入历史，避免原地打转）
-                messages.append(msg)
+                messages.append(self._message_to_dict(msg))
                 messages.append({
                     "role": "user",
                     "content": self._incomplete_feedback(),
                 })
                 continue
 
-            messages.append(msg)
+            messages.append(self._message_to_dict(msg))
 
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
