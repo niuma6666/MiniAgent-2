@@ -1167,8 +1167,17 @@ body {
   -webkit-backdrop-filter: blur(14px) saturate(1.3);
 }
 
+/* 工具面板（右栏）容器去掉自身白底，只留内层 .panel 单层磨砂——
+   否则容器 0.72 + 面板 0.22 双层叠加会把壁纸糊死，与侧栏/聊天区不一致 */
+:root.has-custom-bg .tools-pane {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
 /* 面板内部的实底子块保持较高不透明度，保证代码/工具文字可读 */
 :root.has-custom-bg .tool-card,
+:root.has-custom-bg .tool-entry,
 :root.has-custom-bg .md pre,
 :root.has-custom-bg .md code,
 :root.has-custom-bg .ti-bubble,
