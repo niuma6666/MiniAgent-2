@@ -7,6 +7,7 @@ import SessionSidebar from './components/SessionSidebar'
 import SettingsModal from './components/SettingsModal'
 import ChatPanel from './components/ChatPanel'
 import ToolLogPanel from './components/ToolLogPanel'
+import PetOverlay from './components/PetOverlay'
 
 /**
  * P3 改版布局：
@@ -112,6 +113,7 @@ export default function App() {
       </main>
 
       <SettingsModal />
+      <PetOverlay />
     </div>
   )
 }
