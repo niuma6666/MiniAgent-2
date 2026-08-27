@@ -45,6 +45,18 @@ export interface AgentState {
 
 const MAX_ITEMS = 600
 
+/**
+ * 轻量事件钩子：桌宠等附加 UI 订阅原始 WS 事件流（只读，不改 applyEvent 语义）。
+ * applyEvent 每次收到事件时按注册顺序通知；返回取消订阅函数。
+ */
+const eventListeners = new Set<(e: Record<string, any>) => void>()
+export function onAgentEvent(cb: (e: Record<string, any>) => void): () => void {
+  eventListeners.add(cb)
+  return () => {
+    eventListeners.delete(cb)
+  }
+}
+
 let uidSeq = 0
 let currentAnswerUid: number | null = null
 
@@ -91,6 +103,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   pendingConfirm: { id: null, desc: '' },
 
   applyEvent(e) {
+    for (const cb of eventListeners) cb(e)
     const s = get()
     switch (e.type) {
       case 'hello': {
