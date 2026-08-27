@@ -76,7 +76,14 @@ def build_agent(confirm_callback=None):
     返回 (agent, mcp_clients)；mcp_clients 由调用方（Session）负责在清理时 stop。
     confirm_file_writes=None → 走 env CONFIRM_FILE_WRITES（默认开启）；
     confirm_dangerous 取自配置（env CONFIRM_DANGEROUS，默认开启）。
+
+    Web 决策（PROTOCOL "CCFA-Skills 不加载"）：Web 服务不加载 CCFA 技能、
+    不走 LLM 路由，保持轻量对话。此处直接改本进程环境变量——
+    CLI 是独立进程，其 env 不受影响，CCFA 能力仅 CLI 保留。
     """
+    # 覆盖为 Web 环境（幂等）：去掉 CCFA_SKILLS_ROOT 触发，关掉 LLM 路由开关。
+    os.environ.pop("CCFA_SKILLS_ROOT", None)
+    os.environ["LLM_ROUTE_SKILLS"] = "0"
     cfg = load_config()
     agent = MiniAgent(
         model=cfg.llm.model,
@@ -130,25 +137,68 @@ class Session:
         self._confirm_lock = threading.Lock()
         # 必须在事件循环线程里创建（WS 处理器中调用，天然满足）
         self.loop = asyncio.get_running_loop()
+        # v2.1（广播）：aqueue 兼任"无连接期间的 backlog"（断线补发用）；
+        # conns 是活动连接注册表（每个连接一个专属事件队列）。
         self.aqueue: asyncio.Queue = asyncio.Queue()
+        self.conns: Dict[WebSocket, asyncio.Queue] = {}
 
-    # ---------- 事件通道（P0 同款） ----------
+    # ---------- 事件通道（P0 同款，v2.1 广播） ----------
     def push(self, event: dict):
-        """工作线程里调用，线程安全投递到会话事件队列"""
-        self.loop.call_soon_threadsafe(self.aqueue.put_nowait, event)
+        """工作线程里调用，线程安全广播到该会话所有活动连接的专属队列。
+
+        v2.1（广播）：同一会话的多个连接（如仪表盘 + 桌宠）各自收到完整事件流，
+        互不竞争；没有任何活动连接时事件累积进会话 backlog（aqueue），
+        下一个注册的连接一次性按序补发（保留"断线补发"语义）。
+        """
+        self.loop.call_soon_threadsafe(self._broadcast, event)
+
+    def _broadcast(self, event: dict):
+        """事件循环线程内执行：扇出到每个连接的专属队列（无连接时进 backlog）。
+
+        与 register/unregister 同在事件循环线程且不 await，彼此原子；
+        put_nowait 不会阻塞（无界队列），也不会跨线程竞态。
+        """
+        if self.conns:
+            for q in list(self.conns.values()):
+                q.put_nowait(event)
+        else:
+            self.aqueue.put_nowait(event)
+
+    def register(self, ws: WebSocket) -> asyncio.Queue:
+        """注册一个连接，返回其专属事件队列（先按序补发 backlog）。
+
+        必须在事件循环线程调用（ws_endpoint 中满足，与 _broadcast 原子）。
+        注册后该连接收到：注册前积压的 backlog（按序）+ 注册后的实时广播。
+        """
+        q = asyncio.Queue()
+        self.conns[ws] = q
+        while not self.aqueue.empty():
+            try:
+                q.put_nowait(self.aqueue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return q
+
+    def unregister(self, ws: WebSocket):
+        """连接结束（断开/取消）时注销，丢弃其专属队列。"""
+        self.conns.pop(ws, None)
 
     async def pump(self, ws: WebSocket):
-        """把会话队列里的事件逐条发给当前连接（每连接一个 pump task）。
+        """把该连接专属队列里的事件逐条发给当前连接（每连接一个 pump task）。
 
         A2：发送失败（连接已断开等）时静默退出，不再抛未处理异常；
-        连接级清理由 ws_endpoint 的 finally 负责。
+        连接级清理由 ws_endpoint 的 finally 负责（注销在 finally 里兜底）。
         """
-        while True:
-            event = await self.aqueue.get()
-            try:
-                await ws.send_json(event)
-            except Exception:
-                return
+        q = self.register(ws)
+        try:
+            while True:
+                event = await q.get()
+                try:
+                    await ws.send_json(event)
+                except Exception:
+                    return
+        finally:
+            self.unregister(ws)
 
     # ---------- MiniAgent 回调适配（P0 同款） ----------
     def tool_cb(self, event, name, payload):
