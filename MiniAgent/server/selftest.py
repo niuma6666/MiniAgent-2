@@ -121,6 +121,47 @@ async def test_reap_idle():
     m.delete(busy.session_id)
 
 
+async def test_broadcast_and_backlog():
+    """v2.1 广播：多连接各自收全量事件；无连接进 backlog；断开只影响自己。"""
+    s = S.Session("bcast-test")
+
+    class FakeWS:
+        def __init__(self, name):
+            self.name = name
+
+        async def send_json(self, event):
+            pass
+
+    # 两个连接同时挂着：push 一次，两边各收到一份完整事件
+    ws1, ws2 = FakeWS("a"), FakeWS("b")
+    q1 = s.register(ws1)
+    q2 = s.register(ws2)
+    s.push({"type": "status", "text": "Thinking (Iteration 1)..."})
+    await asyncio.sleep(0.05)  # 让 _broadcast（call_soon_threadsafe）跑完
+    assert q1.get_nowait() == {"type": "status", "text": "Thinking (Iteration 1)..."}
+    assert q2.get_nowait() == {"type": "status", "text": "Thinking (Iteration 1)..."}
+
+    # ws1 断开：后续事件只到 ws2，q1 不再收
+    s.unregister(ws1)
+    s.push({"type": "stream", "token": "hi"})
+    await asyncio.sleep(0.05)
+    assert q2.get_nowait() == {"type": "stream", "token": "hi"}
+    assert q1.empty()
+
+    # 全部断开：事件累积进 backlog，下一个注册的连接按序补发
+    s.unregister(ws2)
+    s.push({"type": "stream", "token": " "})
+    s.push({"type": "stream", "token": "there"})
+    await asyncio.sleep(0.05)
+    assert s.aqueue.qsize() == 2, "无连接时事件应进 backlog"
+    ws3 = FakeWS("c")
+    q3 = s.register(ws3)
+    assert q3.get_nowait() == {"type": "stream", "token": " "}
+    assert q3.get_nowait() == {"type": "stream", "token": "there"}
+    assert s.aqueue.empty(), "backlog 补发后应清空"
+    s.unregister(ws3)
+
+
 async def run_standalone():
     test_build_query_format()
     record("standalone.build_query 格式", "PASS")
@@ -132,6 +173,8 @@ async def run_standalone():
     record("standalone.pump 静默退出", "PASS")
     await test_reap_idle()
     record("standalone.闲置回收", "PASS")
+    await test_broadcast_and_backlog()
+    record("standalone.广播+backlog补发", "PASS")
 
 
 # ============================================================
@@ -158,6 +201,28 @@ async def e2e_probe(uri):
     except Exception as e:
         print(f"  服务器不可达: {e}")
         return False
+
+
+async def e2e_broadcast_two_conns(uri):
+    """v2.1 广播（不耗 LLM）：同一会话挂多个连接，各自收到 hello（同 sid），互不干扰。"""
+    async with websockets.connect(uri, open_timeout=15) as ws1:
+        await ws1.send(json.dumps({"type": "hello", "session_id": None}))
+        h1 = json.loads(await asyncio.wait_for(ws1.recv(), timeout=15))
+        sid = h1["session_id"]
+        assert sid and h1.get("running") is False
+
+        async with websockets.connect(uri, open_timeout=15) as ws2:
+            await ws2.send(json.dumps({"type": "hello", "session_id": sid}))
+            h2 = json.loads(await asyncio.wait_for(ws2.recv(), timeout=15))
+            assert h2["session_id"] == sid, f"第二连接未认领同一会话: {h2}"
+            assert h2.get("running") is False
+
+        # ws2 关闭后，新连接仍能认领同一会话（注销未破坏注册表）
+        async with websockets.connect(uri, open_timeout=15) as ws3:
+            await ws3.send(json.dumps({"type": "hello", "session_id": sid}))
+            h3 = json.loads(await asyncio.wait_for(ws3.recv(), timeout=15))
+            assert h3["session_id"] == sid, f"第三连接未认领同一会话: {h3}"
+    record("e2e.同会话多连接广播", "PASS")
 
 
 async def e2e_event_flow_and_memory(uri, tmp):
@@ -279,6 +344,7 @@ async def run_e2e(uri, tmp):
     if not await e2e_probe(uri):
         record("e2e.全部", "SKIP", "服务器不可达，跳过（可用 --standalone 只跑单测）")
         return
+    await e2e_broadcast_two_conns(uri)
     await e2e_event_flow_and_memory(uri, tmp)
     await e2e_concurrency_reject(uri)
     await e2e_confirm_allow(uri, tmp)
